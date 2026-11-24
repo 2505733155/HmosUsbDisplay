@@ -7,11 +7,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <iterator>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
 #include "net_server.h"
+#include "touch_protocol.h"
 #include "video_decoder.h"
 
 namespace {
@@ -86,7 +89,9 @@ struct Pipeline {
     bool gotHello = false;
     bool clientConnected = false;
     bool touchEnabled = false;
-    int32_t touchId = -1;
+    bool touchFrames = false;
+    std::array<std::optional<int32_t>, TouchFrame{}.size()> touchIds{};
+    TouchFrame lastTouch{};
     int32_t streamW = 0;
     int32_t streamH = 0;
 
@@ -101,7 +106,7 @@ Pipeline g_pipeline;
 std::thread g_statsThread;
 std::atomic<bool> g_statsRunning{false};
 
-bool ParseHello(const uint8_t *data, size_t len, int32_t *width, int32_t *height, bool *touchEnabled)
+bool ParseHello(const uint8_t *data, size_t len, int32_t *width, int32_t *height, bool *touchEnabled, bool *touchFrames)
 {
     std::string text(reinterpret_cast<const char *>(data), len);
     if (text.find("hello") == std::string::npos) {
@@ -125,6 +130,7 @@ bool ParseHello(const uint8_t *data, size_t len, int32_t *width, int32_t *height
     };
     int32_t touchVersion = 0;
     *touchEnabled = findNum("\"touch\"", &touchVersion) && touchVersion == 1;
+    *touchFrames = *touchEnabled && findNum("\"touchFrames\"", &touchVersion) && touchVersion == 1;
     return findNum("\"width\"", width) && findNum("\"height\"", height);
 }
 
@@ -160,12 +166,12 @@ void OnPacket(const uint8_t *data, size_t len)
     if (!p.gotHello) {
         int32_t w = 0;
         int32_t h = 0;
-        if (ParseHello(data, len, &w, &h, &p.touchEnabled)) {
+        if (ParseHello(data, len, &w, &h, &p.touchEnabled, &p.touchFrames)) {
             p.streamW = w;
             p.streamH = h;
             p.gotHello = true;
             StartDecoderLocked();
-            LOG("hello: %{public}dx%{public}d touch=%{public}d", w, h, p.touchEnabled);
+            LOG("hello: %{public}dx%{public}d touch=%{public}d frames=%{public}d", w, h, p.touchEnabled, p.touchFrames);
         }
         return; // 非 hello 包在握手前一律忽略
     }
@@ -185,8 +191,10 @@ void OnClientState(bool connected)
     p.clientConnected = connected;
     LOG("client %{public}s", connected ? "connected" : "disconnected");
     if (!connected) {
-        p.touchId = -1;
+        p.touchIds = {};
+        p.lastTouch = {};
         p.touchEnabled = false;
+        p.touchFrames = false;
         StopDecoderLocked();
         p.gotHello = false; // 新连接重新握手
     }
@@ -204,16 +212,37 @@ void OnSurfaceCreated(void *window)
     }
 }
 
+bool SendTouchLocked(Pipeline &p, const TouchFrame &frame)
+{
+    if (p.touchFrames) {
+        const auto packet = EncodeTouchFrame(frame);
+        return p.server.SendTouch(packet.data(), packet.size());
+    }
+    uint8_t packet[TOUCH_SAMPLE_BYTES];
+    EncodeTouchSample(frame[0], packet);
+    return p.server.SendTouch(packet, sizeof(packet));
+}
+
+void CancelTouchLocked(Pipeline &p)
+{
+    TouchFrame frame{};
+    bool active = false;
+    for (size_t slot = 0; slot < frame.size(); ++slot) {
+        if (!p.touchIds[slot]) continue;
+        frame[slot].action = TouchAction::Cancel;
+        active = true;
+    }
+    if (active) SendTouchLocked(p, frame);
+    p.touchIds = {};
+    p.lastTouch = {};
+}
+
 void OnSurfaceDestroyed()
 {
     Pipeline &p = g_pipeline;
     std::lock_guard<std::mutex> lock(p.mtx);
     LOG("surface destroyed");
-    if (p.touchId != -1) {
-        const uint8_t cancel[5]{3};
-        p.server.SendTouch(cancel);
-        p.touchId = -1;
-    }
+    CancelTouchLocked(p);
     StopDecoderLocked();
     p.window = nullptr;
     p.windowReady = false;
@@ -358,39 +387,67 @@ void DispatchTouchCb(OH_NativeXComponent *component, void *window)
     if (!p.touchEnabled || !p.gotHello || !p.decoder || !p.decoder->framesDecoded.load()) return;
     const double scale = std::min(static_cast<double>(width) / p.streamW, static_cast<double>(height) / p.streamH);
     const double contentW = p.streamW * scale, contentH = p.streamH * scale;
-    const double x = (event.x - (width - contentW) / 2) / contentW;
-    const double y = (event.y - (height - contentH) / 2) / contentH;
-    uint8_t message[5]{};
+    if (event.type == OH_NATIVEXCOMPONENT_CANCEL) {
+        CancelTouchLocked(p);
+        return;
+    }
+    const auto normalize = [&](float x, float y, TouchSample &sample) {
+        const double nx = (x - (width - contentW) / 2) / contentW;
+        const double ny = (y - (height - contentH) / 2) / contentH;
+        if (!std::isfinite(nx) || !std::isfinite(ny)) return false;
+        sample.x = static_cast<uint16_t>(std::clamp(nx, 0.0, 1.0) * 65535);
+        sample.y = static_cast<uint16_t>(std::clamp(ny, 0.0, 1.0) * 65535);
+        return nx >= 0 && nx < 1 && ny >= 0 && ny < 1;
+    };
+    const auto end = p.touchIds.begin() + (p.touchFrames ? p.touchIds.size() : 1);
+    auto changed = std::find(p.touchIds.begin(), end, std::optional<int32_t>(event.id));
+    TouchSample down{TouchAction::Down};
     if (event.type == OH_NATIVEXCOMPONENT_DOWN) {
-        if (p.touchId != -1 || event.numPoints != 1 || !(x >= 0 && x < 1 && y >= 0 && y < 1)) {
-            LOG("touch down ignored: contacts=%{public}u inside=%{public}d", event.numPoints,
-                x >= 0 && x < 1 && y >= 0 && y < 1);
-            return;
-        }
-        p.touchId = event.id;
-    } else {
-        if (p.touchId != event.id) return;
-        if (event.type == OH_NATIVEXCOMPONENT_MOVE) {
-            message[0] = 1;
-        } else if (event.type == OH_NATIVEXCOMPONENT_UP || event.type == OH_NATIVEXCOMPONENT_CANCEL) {
-            message[0] = event.type == OH_NATIVEXCOMPONENT_UP ? 2 : 3;
-            p.touchId = -1;
-            p.server.SendTouch(message);
-            return;
+        if (changed != end || (!p.touchFrames && event.numPoints != 1) || !normalize(event.x, event.y, down)) return;
+        changed = std::find(p.touchIds.begin(), end, std::nullopt);
+        if (changed == end) return;
+        *changed = event.id;
+    } else if (event.type == OH_NATIVEXCOMPONENT_UP) {
+        if (changed == end) return;
+    } else if (event.type != OH_NATIVEXCOMPONENT_MOVE || (!p.touchFrames && changed == end)) {
+        return;
+    }
+
+    TouchFrame frame{};
+    bool active = false;
+    for (auto id = p.touchIds.begin(); id != end; ++id) {
+        if (!*id) continue;
+        const size_t slot = id - p.touchIds.begin();
+        auto &sample = frame[slot];
+        active = true;
+        if (id == changed && event.type == OH_NATIVEXCOMPONENT_DOWN) {
+            sample = down;
+        } else if (id == changed && event.type == OH_NATIVEXCOMPONENT_UP) {
+            sample.action = TouchAction::Up;
+            id->reset();
         } else {
-            return;
+            sample = p.lastTouch[slot];
+            sample.action = TouchAction::Move;
+            if (id == changed) {
+                normalize(event.x, event.y, sample);
+            } else {
+                for (size_t i = 0; i < std::min<size_t>(event.numPoints, std::size(event.touchPoints)); ++i) {
+                    const auto &point = event.touchPoints[i];
+                    if (point.id == **id && point.isPressed) {
+                        normalize(point.x, point.y, sample);
+                        break;
+                    }
+                }
+            }
         }
     }
-    if (!std::isfinite(x) || !std::isfinite(y)) return;
-    const uint16_t nx = static_cast<uint16_t>(std::clamp(x, 0.0, 1.0) * 65535);
-    const uint16_t ny = static_cast<uint16_t>(std::clamp(y, 0.0, 1.0) * 65535);
-    message[1] = nx >> 8;
-    message[2] = nx & 0xff;
-    message[3] = ny >> 8;
-    message[4] = ny & 0xff;
-    const bool sent = p.server.SendTouch(message);
-    if (event.type == OH_NATIVEXCOMPONENT_DOWN) LOG("touch down forwarded=%{public}d", sent);
-    if (!sent) p.touchId = -1;
+    if (!active) return;
+    if (SendTouchLocked(p, frame)) {
+        p.lastTouch = frame;
+    } else {
+        p.touchIds = {};
+        p.lastTouch = {};
+    }
 }
 
 napi_value Init(napi_env env, napi_value exports)

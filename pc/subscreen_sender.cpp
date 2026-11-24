@@ -98,6 +98,7 @@
 #endif
 #include <psapi.h> // GetProcessMemoryInfo: 统计行显示进程提交内存, 泄漏一眼可见
 #include <memory>
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -109,6 +110,7 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
@@ -4161,7 +4163,8 @@ struct Args
     int vddHz = 60;
     std::string side = "left"; // 虚拟显示器摆在外接屏的哪一侧
     bool watch = false;        // 插拔守护模式
-    bool touch = false;        // --touch: single-finger native input in USB watch mode
+    bool touch = false;        // --touch: native input in USB watch mode
+    bool once = false;         // --once: exit after the USB session ends
     int watchIntervalMs = 1000;
     int unplugDelayMs = 2000;
     bool launchApp = false;    // 检测到设备时尝试拉起平板端 App
@@ -4247,6 +4250,8 @@ static Args ParseArgs(int argc, char **argv)
             a.vdd = true; // 守护模式必然用虚拟显示器
         } else if (s == "--touch") {
             a.touch = true;
+        } else if (s == "--once") {
+            a.once = true;
         } else if (s == "--watch-interval") {
             a.watchIntervalMs = atoi(next().c_str());
             if (a.watchIntervalMs < 200) {
@@ -4368,91 +4373,143 @@ static int CalcKbps(const Args &args, int w, int h)
     return kbps;
 }
 
-static bool InjectContact(HSYNTHETICPOINTERDEVICE device, POINT position, UINT32 flags)
+static POINTER_TYPE_INFO TouchPointer(size_t slot, POINT position, UINT32 flags, POINT desktopOrigin)
 {
     POINTER_TYPE_INFO input{};
     input.type = PT_TOUCH;
     auto &contact = input.touchInfo;
     contact.pointerInfo.pointerType = PT_TOUCH;
-    contact.pointerInfo.pointerId = 1;
+    contact.pointerInfo.pointerId = static_cast<UINT32>(slot + 1);
     // The synthetic pointer API expects coordinates from the virtual screen's top-left.
-    contact.pointerInfo.ptPixelLocation = {position.x - GetSystemMetrics(SM_XVIRTUALSCREEN),
-                                           position.y - GetSystemMetrics(SM_YVIRTUALSCREEN)};
+    contact.pointerInfo.ptPixelLocation = {position.x - desktopOrigin.x, position.y - desktopOrigin.y};
     contact.pointerInfo.pointerFlags = flags;
-    return InjectSyntheticPointerInput(device, &input, 1) != FALSE;
+    return input;
+}
+
+static bool TouchDisplayMode(const DupCapture &cap, DEVMODEW &mode)
+{
+    mode.dmSize = sizeof(mode);
+    if (EnumDisplaySettingsExW(cap.DeviceName().c_str(), ENUM_CURRENT_SETTINGS, &mode, 0) &&
+        mode.dmDisplayOrientation == DMDO_DEFAULT && mode.dmPelsWidth == cap.FullWidth() &&
+        mode.dmPelsHeight == cap.FullHeight()) {
+        return true;
+    }
+    Log("[触控] 虚拟屏模式与采集尺寸不一致 (%lux%lu / %dx%d, rotation=%lu)", mode.dmPelsWidth,
+        mode.dmPelsHeight, cap.FullWidth(), cap.FullHeight(), mode.dmDisplayOrientation);
+    return false;
+}
+
+static bool BuildTouchPointers(const TouchFrame &frame, const DupCapture &cap,
+                               std::array<std::optional<POINT>, TouchFrame{}.size()> &positions,
+                               std::array<POINTER_TYPE_INFO, TouchFrame{}.size()> &inputs, UINT32 &count)
+{
+    const POINT origin{GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN)};
+    DEVMODEW mode{};
+    if (std::any_of(frame.begin(), frame.end(), [](const TouchSample &sample) {
+            return sample.action == TouchAction::Down || sample.action == TouchAction::Move;
+        }) && !TouchDisplayMode(cap, mode)) {
+        return false;
+    }
+    for (size_t slot = 0; slot < frame.size(); ++slot) {
+        const auto &sample = frame[slot];
+        switch (sample.action) {
+        case TouchAction::Idle:
+            break;
+        case TouchAction::Up:
+        case TouchAction::Cancel: {
+            if (!positions[slot]) return false;
+            const UINT32 flags = POINTER_FLAG_UP | (sample.action == TouchAction::Cancel ? POINTER_FLAG_CANCELED : 0);
+            inputs[count++] = TouchPointer(slot, *positions[slot], flags, origin);
+            positions[slot].reset();
+            break;
+        }
+        case TouchAction::Down:
+        case TouchAction::Move: {
+            const POINT target{TouchPixel(sample.x, mode.dmPosition.x, mode.dmPelsWidth),
+                               TouchPixel(sample.y, mode.dmPosition.y, mode.dmPelsHeight)};
+            MONITORINFOEXW monitor{};
+            monitor.cbSize = sizeof(monitor);
+            if (!GetMonitorInfoW(MonitorFromPoint(target, MONITOR_DEFAULTTONULL), &monitor) ||
+                cap.DeviceName() != monitor.szDevice) {
+                Log("[触控] 坐标未命中当前虚拟屏 (%ls)", cap.DeviceName().c_str());
+                return false;
+            }
+            const UINT32 flags = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT |
+                                 (sample.action == TouchAction::Down ? POINTER_FLAG_DOWN : POINTER_FLAG_UPDATE);
+            inputs[count++] = TouchPointer(slot, target, flags, origin);
+            positions[slot] = target;
+            break;
+        }
+        }
+    }
+    return true;
 }
 
 static void ReceiveTouch(TcpClient &tcp, const DupCapture &cap, const std::atomic<bool> &stop,
-                         std::atomic<bool> &streamDead)
+                         std::atomic<bool> &streamDead, bool monitorDisconnect)
 {
     const auto previousDpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    const auto device = CreateSyntheticPointerDevice(PT_TOUCH, 1, POINTER_FEEDBACK_NONE);
+    const auto device = CreateSyntheticPointerDevice(PT_TOUCH, static_cast<ULONG>(TouchFrame{}.size()),
+                                                      POINTER_FEEDBACK_NONE);
     if (!device) {
         Log("[触控] Windows 初始化失败 (%lu)", GetLastError());
-        if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
-        return;
+        if (!monitorDisconnect) {
+            if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
+            return;
+        }
     }
-    TouchSequence sequence;
-    POINT last{};
-    bool injectedDown = false;
-    uint8_t message[5];
-    int received = 0;
+    TouchFrameSequence sequence;
+    std::array<std::optional<POINT>, TouchFrame{}.size()> positions{};
+    TouchPacket message{};
+    size_t received = 0;
+    size_t expected = 1;
     while (!stop.load() && !streamDead.load() && !cap.ModeChanged()) {
-        const int n = tcp.ReadTouchBytes(message + received, static_cast<int>(sizeof(message)) - received);
+        const int n = tcp.ReadTouchBytes(message.data() + received, static_cast<int>(expected - received));
         if (n < 0) {
             streamDead = true;
             break;
         }
         received += n;
-        if (received != static_cast<int>(sizeof(message))) continue;
+        if (received == 0) continue;
+        if (expected == 1) expected = TouchPacketSize(message[0]);
+        if (received < expected) continue;
+        TouchFrame frame{};
+        if (!DecodeTouchFrame(message.data(), expected, frame) || !sequence.Accept(frame)) {
+            Log("[触控] 触点数据或顺序无效，结束当前输入通道 (header=%u)", message[0]);
+            break;
+        }
         received = 0;
-        const auto action = static_cast<TouchAction>(message[0]);
-        if (!sequence.Accept(action)) {
-            Log("[触控] 触点顺序无效，结束当前输入通道 (action=%u)", message[0]);
-            break;
-        }
-        if (action == TouchAction::Up || action == TouchAction::Cancel) {
-            UINT32 flags = POINTER_FLAG_UP;
-            if (action == TouchAction::Cancel) flags |= POINTER_FLAG_CANCELED;
-            if (!InjectContact(device, last, flags)) {
-                Log("[触控] 释放触点失败 (Windows %lu)", GetLastError());
-                break;
-            }
-            injectedDown = false;
-            continue;
-        }
+        expected = 1;
+        // Quiet mode must still observe EOF when touch device creation fails.
+        if (!device) continue;
 
-        DEVMODEW mode{};
-        mode.dmSize = sizeof(mode);
-        if (!EnumDisplaySettingsExW(cap.DeviceName().c_str(), ENUM_CURRENT_SETTINGS, &mode, 0) ||
-            mode.dmDisplayOrientation != DMDO_DEFAULT || mode.dmPelsWidth != cap.FullWidth() ||
-            mode.dmPelsHeight != cap.FullHeight()) {
-            Log("[触控] 虚拟屏模式与采集尺寸不一致 (%lux%lu / %dx%d, rotation=%lu)", mode.dmPelsWidth,
-                mode.dmPelsHeight, cap.FullWidth(), cap.FullHeight(), mode.dmDisplayOrientation);
+        auto nextPositions = positions;
+        std::array<POINTER_TYPE_INFO, TouchFrame{}.size()> inputs{};
+        UINT32 count = 0;
+        if (!BuildTouchPointers(frame, cap, nextPositions, inputs, count)) break;
+        if (count != 0 && !InjectSyntheticPointerInput(device, inputs.data(), count)) {
+            Log("[触控] 原生输入失败 (Windows %lu, points=%u)", GetLastError(), count);
             break;
         }
-        POINT target{TouchPixel((message[1] << 8) | message[2], mode.dmPosition.x, mode.dmPelsWidth),
-                     TouchPixel((message[3] << 8) | message[4], mode.dmPosition.y, mode.dmPelsHeight)};
-        MONITORINFOEXW monitor{};
-        monitor.cbSize = sizeof(monitor);
-        if (!GetMonitorInfoW(MonitorFromPoint(target, MONITOR_DEFAULTTONULL), &monitor) ||
-            cap.DeviceName() != monitor.szDevice) {
-            Log("[触控] 坐标未命中当前虚拟屏 (%ls)", cap.DeviceName().c_str());
-            break;
+        if (std::any_of(frame.begin(), frame.end(), [](const TouchSample &sample) {
+                return sample.action == TouchAction::Down;
+            })) {
+            Log("[触控] Windows 已接受按下 (points=%u)", count);
         }
-        UINT32 flags = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT |
-                       (action == TouchAction::Down ? POINTER_FLAG_DOWN : POINTER_FLAG_UPDATE);
-        if (!InjectContact(device, target, flags)) {
-            Log("[触控] 原生输入失败 (Windows %lu, action=%u, point=%ld,%ld)", GetLastError(), message[0],
-                target.x, target.y);
-            break;
-        }
-        if (action == TouchAction::Down) Log("[触控] Windows 已接受按下");
-        last = target;
-        injectedDown = true;
+        positions = nextPositions;
     }
-    if (injectedDown) InjectContact(device, last, POINTER_FLAG_UP | POINTER_FLAG_CANCELED);
-    DestroySyntheticPointerDevice(device);
+    const POINT origin{GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN)};
+    std::array<POINTER_TYPE_INFO, TouchFrame{}.size()> cancellations{};
+    UINT32 count = 0;
+    for (size_t slot = 0; slot < positions.size(); ++slot) {
+        if (positions[slot]) {
+            cancellations[count++] = TouchPointer(slot, *positions[slot], POINTER_FLAG_UP | POINTER_FLAG_CANCELED, origin);
+        }
+    }
+    if (count != 0 && !InjectSyntheticPointerInput(device, cancellations.data(), count)) {
+        Log("[触控] 取消触点失败 (Windows %lu, points=%u)", GetLastError(), count);
+    }
+    if (device) DestroySyntheticPointerDevice(device);
     if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
 }
 
@@ -4522,6 +4579,10 @@ static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int
     // 主循环: 连接 → 编码发送 → 断开重连
     auto lastWaitLog = Clock::now();
     while (!stopped() && !capDead.load()) {
+        if (args.once && Clock::now() - tStart >= std::chrono::seconds(30)) {
+            Log("[单次会话] 30 秒内未能建立推流，请确认平板已解锁并打开 SubScreen");
+            break;
+        }
         // 泄漏二分诊断模式: 只跑捕获(+GPU 缩放)路径, 不建编码器不连网。
         // 若此模式 commit 照涨 → 泄漏在捕获/驱动侧; 不涨 → 在编码器(MFT)侧。
         if (args.noEncode) {
@@ -4607,7 +4668,7 @@ static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int
         const bool touch = args.touch;
         char hello[128];
         snprintf(hello, sizeof(hello), "{\"type\":\"hello\",\"width\":%d,\"height\":%d%s}", w, h,
-                 touch ? ",\"touch\":1" : "");
+                 touch ? ",\"touch\":1,\"touchFrames\":1" : "");
         size_t hl = strlen(hello);
         uint8_t hdr[4] = {(uint8_t)(hl >> 24), (uint8_t)(hl >> 16), (uint8_t)(hl >> 8), (uint8_t)hl};
         if (!tcp.SendAll(hdr, 4) || !tcp.SendAll(hello, hl)) {
@@ -4638,7 +4699,7 @@ static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int
         std::thread touchThread;
         if (touch) {
             touchThread = std::thread(ReceiveTouch, std::ref(tcp), std::cref(cap), std::cref(touchStop),
-                                      std::ref(streamDead));
+                                      std::ref(streamDead), args.once);
         }
 
         uint64_t lastBytes = 0, lastEnc = 0;
@@ -4699,6 +4760,10 @@ static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int
         enc.Destroy();
         tcp.Close();
         if (stopped()) {
+            break;
+        }
+        if (args.once) {
+            Log("[单次会话] 平板接收端连接已结束");
             break;
         }
         Log("连接断开, 1 秒后重连...");
@@ -4840,6 +4905,7 @@ static int WatchSession(const Args &args, const std::string &hdc)
     }
     stopMon();
     Log("会话结束: 编码 %llu 帧, 发送 %.1f MB", (unsigned long long)aus, (double)bytes / 1024 / 1024);
+    if (args.once && aus == 0 && !deviceGone.load() && !g_exit.load()) return 3;
     return 0;
 }
 
@@ -4860,6 +4926,10 @@ static int WatchLoop(const Args &args)
     int failRun = 0;
     while (!g_exit.load()) {
         if (!HdcDevicePresent(hdc, args.touch)) {
+            if (args.once) {
+                Log("[单次会话] 启动时未检测到唯一的 USB 平板");
+                return 3;
+            }
             if (online) {
                 Log("平板已拔出");
                 online = false;
@@ -4882,6 +4952,10 @@ static int WatchLoop(const Args &args)
             }
         }
         if (!CreateFport(hdc, args.port)) {
+            if (args.once) {
+                Log("[单次会话] 无法建立 HDC 转发");
+                return 3;
+            }
             Log("[警告] fport 未就绪, 稍后重试");
             SleepInterruptible(args.watchIntervalMs);
             continue;
@@ -4889,6 +4963,10 @@ static int WatchLoop(const Args &args)
 
         int rc = WatchSession(args, hdc);
         RemoveFport(hdc, args.port);
+        if (args.once) {
+            Log("单次会话已退出");
+            return rc;
+        }
         if (g_exit.load()) {
             break;
         }
@@ -5645,6 +5723,10 @@ int main(int argc, char **argv)
     WSADATA wsa{};
     WSAStartup(MAKEWORD(2, 2), &wsa);
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
+    if (args.once && (!args.watch || !args.touch)) {
+        Log("[错误] --once 需要同时使用 --watch 和 --touch");
+        return 3;
+    }
     if (args.touch && (!args.watch || args.gui || args.nohdc || args.noEncode || args.noNet ||
                        !args.source.empty() || args.host != "127.0.0.1")) {
         Log("[错误] --touch 仅用于本机 HDC 转发的 USB 虚拟扩展屏守护模式");

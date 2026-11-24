@@ -28,5 +28,5 @@ subscreen_sender.exe --watch --vdd 1920x1080@60 --fps 25 --launch-app %*
 set RC=%ERRORLEVEL%
 echo.
 echo watcher exited with code %RC%
-if not "%RC%"=="0" pause
+if not "%RC%"=="0" if not "%SUBSCREEN_DESKTOP_LAUNCH%"=="1" pause
 exit /b %RC%

@@ -1,9 +1,6 @@
 #pragma once
 
-#include <cstdint>
-
-// Version 1 sends one action byte and two big-endian normalized coordinates.
-enum class TouchAction : uint8_t { Down, Move, Up, Cancel };
+#include "../harmony/entry/src/main/cpp/touch_protocol.h"
 
 inline int TouchPixel(uint16_t value, int origin, int length)
 {
@@ -26,10 +23,28 @@ public:
             if (!down_) return false;
             down_ = false;
             return true;
+        case TouchAction::Idle:
+            return !down_;
         }
         return false;
     }
 
 private:
     bool down_ = false;
+};
+
+class TouchFrameSequence {
+public:
+    bool Accept(const TouchFrame &frame)
+    {
+        auto next = slots_;
+        for (size_t slot = 0; slot < frame.size(); ++slot) {
+            if (!next[slot].Accept(frame[slot].action)) return false;
+        }
+        slots_ = next;
+        return true;
+    }
+
+private:
+    std::array<TouchSequence, TouchFrame{}.size()> slots_{};
 };

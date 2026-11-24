@@ -20,7 +20,7 @@ public:
     bool Start(uint16_t port, PacketHandler onPacket, StateHandler onState);
     void Stop();
     bool IsRunning() const { return running_.load(); }
-    bool SendTouch(const uint8_t (&message)[5]);
+    bool SendTouch(const uint8_t *message, size_t size);
 
 private:
     void Run();

@@ -68,15 +68,17 @@ $hdc = Join-Path $devEco 'sdk\default\openharmony\toolchains\hdc.exe'
 
 ### Windows 原生触控试用
 
-同时更新 Windows 发送端和鸿蒙接收端后，启动守护模式时加 `--touch`。本机已配置的启动脚本用法如下。
+更新 Windows 发送端和鸿蒙接收端后，接上平板，再双击桌面快捷方式或项目根目录的 `启动扩展屏.cmd`。命令行窗口可能短暂闪现，随后扩展屏与触控在后台运行。拔掉 USB 或关闭平板上的 SubScreen 会结束这次会话。再次使用时双击启动。日志保存在 `pc/sender.log`。
+
+从 PowerShell 启动时，也可以使用本机已配置的脚本。
 
 ```powershell
 & .\.local\start-subscreen.cmd --touch
 ```
 
-本机也可在 VS Code 中通过 `Tasks: Run Task` 运行「SubScreen：试用单指触控」。保留本机启动脚本及历史试验材料的路径见[阶段清理记录](docs/daily-use-cleanup.md)。
+本机也可在 VS Code 中通过 `Tasks: Run Task` 运行「SubScreen：试用单指触控」。Task 保留终端和自动重连，可用 **Ctrl+C** 停止。保留本机启动脚本及历史试验材料的路径见[阶段清理记录](docs/daily-use-cleanup.md)。
 
-触控仅在明确开启、只有一台通过 USB 连接的 HDC 设备且虚拟屏为横向时生效。单指点按和拖动作为 Windows 原生触点发送到虚拟屏，已在本机通过鸿蒙平板自动测试和手动复核。发送端会忽略从黑边开始的触点，并在 USB 断开时释放正在进行的触点。触点释放和旧接收端兼容性仍待回归验证。[真机验证记录](docs/usb-verification.md)
+触控仅在明确开启、只有一台通过 USB 连接的 HDC 设备且虚拟屏为横向时生效。新版两端配合可回传两个原生触点，单指点按和双指捏合缩放已通过真机复核。双指捏合由支持触屏的 Windows 应用识别。与上一代支持触控的版本搭配时沿用单指协议。按住手指时拔线的专项回归仍待实测。[真机验证记录](docs/usb-verification.md)
 
 ### 20 秒真机检查
 

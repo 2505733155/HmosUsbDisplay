@@ -96,3 +96,21 @@ USB 回归使用同一套修正后的 Windows 发送端。发送端以约 25 fps
 | 平板手动复核 | 用户在蓝色测试窗口内点按并拖动，窗口收到 `NATIVE_TAP` 和 `NATIVE_DRAG` 后自动关闭，用户确认关闭。 | `.local/daily-tests/touch-probe/native-213715/gestures.log` |
 
 两轮触控测试结束后均恢复了原显示布局并回收测试用 HDC 转发。新版 HAP 保留在平板。本轮未单独实测按住时拔线或旧接收端兼容性。两次历史桌面卡死的根因仍待确认。
+
+## 双指触控
+
+Windows 发送端在启用触控时同时公布单指和双触点帧能力，鸿蒙接收端仅在识别到双触点帧能力后才发送新格式。新版发送端仍接收旧版的单触点消息。每帧包含两个固定槽位的触点状态。手指从画面内按下时才分配槽位，抬起后可复用。Windows 批量注入同一帧的活动触点，断开时取消仍按住的触点。
+
+Windows 发送端和签名 HAP 已构建，离线检查覆盖旧格式、两触点同帧、先后抬起、取消和非法帧。
+
+首次真机复核中，D3D11 设备创建成功，DXGI 桌面复制返回访问拒绝，尚未建立串流。测试退出后恢复原显示布局、清理转发并恢复旧版 HAP。日志保存于 `.local/daily-tests/multi-touch-223857/`。
+
+第二次在 Windows 桌面会话中建立了 USB 扩展串流。用户在测试窗口中点按，再用双指拉开。Windows 测试窗口记录 `NATIVE_SINGLE_RELEASE`、`NATIVE_TWO_CONTACTS` 和 `NATIVE_PINCH_ZOOM`，原生缩放结束后窗口自动关闭。运行证据保存在 `.local/daily-tests/multi-touch-224053/`。测试退出后回到原单屏布局，HDC 转发列表为空。新版 HAP 留在平板上，通过复核的发送端已放入 `pc/subscreen_sender.exe`。旧版回滚包和发送端保存在 `.local/multi-touch-build/rollback/`。本轮未单独测试按住两个触点时拔线。
+
+## 桌面静默启动
+
+双击入口把启动交给 Windows Script Host，批处理窗口随即退出。后台使用 `--watch --touch --once`。VS Code 仍运行原守护模式。替身脚本测试覆盖了本机 HDC 入口与默认入口，并验证父命令行退出。
+
+真机以单次会话启动，建立 USB 扩展串流后通过 HDC 停止平板上的 SubScreen。USB 仍连接，Windows 发送端自行退出，虚拟屏和 HDC 转发均已回收。本地证据位于 `.local/daily-tests/desktop-exit-230004/`。
+
+用户随后双击桌面快捷方式，看到画面后拔掉 USB。Windows 日志记录了虚拟屏移除和单次会话退出，现场检查确认发送端已关闭、转发列表为空，显示已恢复单屏。证据位于 `.local/daily-tests/desktop-unplug-230145/`。本轮未测试按住两个触点时拔线。
