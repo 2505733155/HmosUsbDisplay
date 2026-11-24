@@ -13,7 +13,7 @@ cd /d "%~dp0"
 if not exist "subscreen_sender.exe" (
     echo [ERROR] subscreen_sender.exe not found in "%CD%"
     echo         build it first:
-    echo           powershell -ExecutionPolicy Bypass -File .\build.ps1
+    echo           pwsh -File .\build.ps1
     exit /b 1
 )
 
@@ -23,10 +23,10 @@ echo  Keep this window open. Press Ctrl+C to stop.
 echo ============================================================
 echo.
 
-subscreen_sender.exe --watch %*
+subscreen_sender.exe --watch --vdd 1920x1080@60 --fps 25 --launch-app %*
 
 set RC=%ERRORLEVEL%
 echo.
 echo watcher exited with code %RC%
-pause
-endlocal
+if not "%RC%"=="0" pause
+exit /b %RC%

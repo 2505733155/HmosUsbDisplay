@@ -122,12 +122,31 @@ void NetServer::Run()
         if (onState_) {
             onState_(true);
         }
+        {
+            std::lock_guard<std::mutex> lock(clientMutex_);
+            clientFd_ = clientFd;
+        }
         ClientLoop(clientFd);
+        {
+            std::lock_guard<std::mutex> lock(clientMutex_);
+            clientFd_ = -1;
+        }
         ::close(clientFd);
         if (onState_) {
             onState_(false);
         }
     }
+}
+
+bool NetServer::SendTouch(const uint8_t (&message)[5])
+{
+    std::lock_guard<std::mutex> lock(clientMutex_);
+    if (clientFd_ < 0) return false;
+    const ssize_t n = ::send(clientFd_, message, sizeof(message), MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (n == sizeof(message)) return true;
+    // A dropped release or a partial record must end the input session.
+    ::shutdown(clientFd_, SHUT_RDWR);
+    return false;
 }
 
 void NetServer::ClientLoop(int clientFd)

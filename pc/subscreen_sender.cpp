@@ -53,6 +53,7 @@
 //   --watch-interval MS  设备轮询间隔, 默认 1000
 //   --unplug-delay MS    拔出去抖延迟, 默认 2000(线材抖一下不会重建屏)
 //   --launch-app         检测到设备时尝试拉起平板 App(锁屏时会失败, 属正常)
+//   --touch              在 USB 守护模式显式启用单指 Windows 原生触控
 //
 // 推流:
 //     --output N        捕获显示器索引(见 --list), 默认主显示器
@@ -96,6 +97,7 @@
 #define PSAPI_VERSION 2
 #endif
 #include <psapi.h> // GetProcessMemoryInfo: 统计行显示进程提交内存, 泄漏一眼可见
+#include <memory>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -114,6 +116,7 @@
 
 // Parsec VDD core API (内核 IddCx 虚拟显示驱动的用户态控制接口, 自带 setupapi/cfgmgr32 链接指令)
 #include "third_party/parsec-vdd.h"
+#include "touch_input.h"
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -1005,30 +1008,50 @@ struct OutputEntry
 
 // attachedOnly=true 只返回已挂到桌面的输出(可捕获); false 时把枚举到的全部输出都列出来,
 // 用于诊断"显示器被驱动创建了但没挂上桌面"这一类问题。
-static std::vector<OutputEntry> EnumOutputs(bool attachedOnly = true)
+static std::vector<OutputEntry> EnumOutputs(bool attachedOnly = true, bool traceCaptureInit = false)
 {
     std::vector<OutputEntry> list;
     ComPtr<IDXGIFactory1> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+    if (traceCaptureInit) ProbeLog("capture init: CreateDXGIFactory1");
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) {
+        if (traceCaptureInit) ProbeLog("capture init: CreateDXGIFactory1 failed (0x%08lX)", hr);
         return list;
     }
     int idx = 0;
     for (UINT a = 0;; a++) {
         ComPtr<IDXGIAdapter1> adapter;
-        if (factory->EnumAdapters1(a, &adapter) == DXGI_ERROR_NOT_FOUND) {
+        if (traceCaptureInit) ProbeLog("capture init: EnumAdapters1(%u)", a);
+        hr = factory->EnumAdapters1(a, &adapter);
+        if (hr == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        if (FAILED(hr) || !adapter) {
+            if (traceCaptureInit) ProbeLog("capture init: EnumAdapters1 failed (0x%08lX)", hr);
             break;
         }
         DXGI_ADAPTER_DESC1 ad{};
         adapter->GetDesc1(&ad);
         for (UINT o = 0;; o++) {
             ComPtr<IDXGIOutput> out;
-            if (adapter->EnumOutputs(o, &out) == DXGI_ERROR_NOT_FOUND) {
+            if (traceCaptureInit) ProbeLog("capture init: EnumOutputs(adapter=%u, output=%u)", a, o);
+            hr = adapter->EnumOutputs(o, &out);
+            if (hr == DXGI_ERROR_NOT_FOUND) {
+                break;
+            }
+            if (FAILED(hr) || !out) {
+                if (traceCaptureInit) ProbeLog("capture init: EnumOutputs failed (0x%08lX)", hr);
                 break;
             }
             OutputEntry e;
             e.index = idx++;
             e.adapterName = ad.Description;
-            out->GetDesc(&e.desc);
+            if (traceCaptureInit) ProbeLog("capture init: GetDesc(adapter=%u, output=%u)", a, o);
+            hr = out->GetDesc(&e.desc);
+            if (FAILED(hr)) {
+                if (traceCaptureInit) ProbeLog("capture init: GetDesc failed (0x%08lX)", hr);
+                continue;
+            }
             e.deviceName = e.desc.DeviceName;
             e.adapter = adapter;
             ComPtr<IDXGIOutput1> out1;
@@ -1119,7 +1142,8 @@ public:
     bool Init(int outputIndex, const std::string &sourceMatch, int scale, int wantW, int wantH, int *outW,
               int *outH)
     {
-        auto outputs = EnumOutputs();
+        auto outputs = EnumOutputs(true, true);
+        ProbeLog("capture init: DXGI enumeration finished (%zu outputs)", outputs.size());
         if (outputs.empty()) {
             Log("[错误] 未找到任何连接到桌面的显示器输出");
             return false;
@@ -1174,9 +1198,10 @@ public:
                 sel = &outputs[0];
             }
         }
-        outRect_ = sel->desc.DesktopCoordinates;
-        w_ = outRect_.right - outRect_.left;
-        h_ = outRect_.bottom - outRect_.top;
+        const RECT &outRect = sel->desc.DesktopCoordinates;
+        deviceName_ = sel->deviceName;
+        w_ = outRect.right - outRect.left;
+        h_ = outRect.bottom - outRect.top;
         if (sel->output == nullptr) {
             Log("[错误] 输出 %ls 不支持 IDXGIOutput1, 无法桌面复制", sel->deviceName.c_str());
             return false;
@@ -1198,11 +1223,11 @@ public:
         }
         srcW_ = w_;
         srcH_ = h_;
-        outRect_.right = outRect_.left + w_;
-        outRect_.bottom = outRect_.top + h_;
 
+        ProbeLog("capture init: D3D11CreateDevice(output=%d)", sel->index);
         HRESULT hr = D3D11CreateDevice(sel->adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
                                        D3D11_SDK_VERSION, &dev_, nullptr, &ctx_);
+        ProbeLog("capture init: D3D11CreateDevice returned 0x%08lX", hr);
         if (FAILED(hr)) {
             Log("[错误] D3D11 设备创建失败: 0x%08lX", hr);
             return false;
@@ -1445,6 +1470,7 @@ public:
     bool HasBgra() const { return workValid_ || baseValid_; }
     int FullWidth() const { return w_; }
     int FullHeight() const { return h_; }
+    const std::wstring &DeviceName() const { return deviceName_; }
     // ---- 性能计时(累计值, 单位微秒; frameN 是"真正做了转换的帧数") ----
     // 用来把每帧耗时拆成: 读回搬运 / 鼠标合成 / BGRA→NV12 转换 三段, 定位瓶颈。
     uint64_t MapUs() const { return mapUs_.load(); }
@@ -1460,7 +1486,7 @@ public:
     bool HasFrame() const { return haveFrame_; }
     // 捕获源的分辨率在运行中被改过(用户在显示设置里调整)。上层应据此重建会话,
     // 否则尺寸不匹配会让所有帧被丢弃、画面永久冻结。
-    bool ModeChanged() const { return modeChanged_; }
+    bool ModeChanged() const { return modeChanged_.load(); }
     void ForceDirty() { frameDirty_ = true; } // 仅捕获线程调用
 
     // 显式释放全部捕获资源。必须在移除所捕获的显示器(虚拟显示器)之前调用,
@@ -1516,6 +1542,10 @@ private:
 
     void UpdateCursor(const DXGI_OUTDUPL_FRAME_INFO &info)
     {
+        // DXGI leaves the pointer position unspecified on desktop-only updates.
+        if (info.LastMouseUpdateTime.QuadPart == 0) {
+            return;
+        }
         cursorVisible_ = info.PointerPosition.Visible != 0;
         cursorPos_ = info.PointerPosition.Position;
         if (info.PointerShapeBufferSize > 0) {
@@ -1528,9 +1558,9 @@ private:
             if (SUCCEEDED(dup_->GetFramePointerShape((UINT)cursorBuf_.size(), cursorBuf_.data(), &got, &si))) {
                 cursor_.type = si.Type;
                 cursor_.w = si.Width;
-                cursor_.h = si.Height;
+                // Monochrome shapes stack the AND and XOR masks vertically.
+                cursor_.h = (si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) ? si.Height / 2 : si.Height;
                 cursor_.pitch = si.Pitch;
-                cursor_.hot = si.HotSpot;
                 cursor_.data.assign(cursorBuf_.data(), cursorBuf_.data() + got);
                 shapeDirty_ = true;
             }
@@ -1539,16 +1569,17 @@ private:
 
     void DrawCursor()
     {
-        int cx = cursorPos_.x - cursor_.hot.x - outRect_.left;
-        int cy = cursorPos_.y - cursor_.hot.y - outRect_.top;
+        // DXGI already reports the shape's top-left relative to this output.
+        int cx = cursorPos_.x;
+        int cy = cursorPos_.y;
         int cw = (int)cursor_.w;
         int ch = (int)cursor_.h;
         if (cx >= w_ || cy >= h_ || cx + cw <= 0 || cy + ch <= 0) {
             return;
         }
         const size_t pitch = (size_t)w_ * 4;
-        if (cursor_.type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR ||
-            cursor_.type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
+        const bool masked = cursor_.type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR;
+        if (cursor_.type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR || masked) {
             const uint8_t *s = cursor_.data.data();
             for (int r = 0; r < ch; r++) {
                 int dy = cy + r;
@@ -1564,6 +1595,13 @@ private:
                     }
                     uint8_t B = row[c * 4 + 0], G = row[c * 4 + 1], R = row[c * 4 + 2], A = row[c * 4 + 3];
                     uint8_t *p = d + (size_t)dx * 4;
+                    if (masked) {
+                        // For masked color, alpha selects replacement or XOR.
+                        p[0] = A ? p[0] ^ B : B;
+                        p[1] = A ? p[1] ^ G : G;
+                        p[2] = A ? p[2] ^ R : R;
+                        continue;
+                    }
                     if (A == 0) {
                         continue;
                     }
@@ -1623,7 +1661,7 @@ private:
     bool baseValid_ = false;     // baseBgra_ 是否为"本帧"内容(GPU 帧不回读, 会置 false)
     std::atomic<uint64_t> gpuFrames_{0}, gpuFail_{0};
     int w_ = 0, h_ = 0;
-    RECT outRect_{};
+    std::wstring deviceName_;
     std::vector<uint8_t> baseBgra_, workBgra_, nv12_, uPlane_, vPlane_, cursorBuf_;
     std::vector<uint8_t> nv12s_;   // 降采样后的 NV12(--scale 2/4 时才用)
     int srcW_ = 0, srcH_ = 0;      // DDA 实际交出来的帧尺寸(与 w_/h_ 相同; 纯映射模式)
@@ -1632,7 +1670,7 @@ private:
     bool haveFrame_ = false;
     bool frameDirty_ = false;
     bool shapeDirty_ = false;
-    bool modeChanged_ = false;
+    std::atomic<bool> modeChanged_{false};
     bool workValid_ = false; // workBgra_ 是否是本帧的有效拷贝(仅在需要合成鼠标时)
     // 性能计时累加器(捕获线程写, 统计线程读)
     std::atomic<uint64_t> mapUs_{0}, curUs_{0}, convUs_{0}, frameN_{0};
@@ -1644,7 +1682,6 @@ private:
     {
         UINT type = DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME;
         UINT w = 0, h = 0, pitch = 0;
-        POINT hot{};
         std::vector<uint8_t> data;
     } cursor_;
 };
@@ -2234,6 +2271,14 @@ private:
         }
         DWORD status = 0;
         HRESULT hr = mft_->ProcessOutput(0, 1, &ob, &status);
+        // ProcessOutput transfers ownership of MFT-supplied samples and events.
+        // A sample allocated above is already owned by `own`.
+        ComPtr<IMFSample> provided;
+        if (ob.pSample != own.Get()) {
+            provided.Attach(ob.pSample);
+        }
+        ComPtr<IMFCollection> events;
+        events.Attach(ob.pEvents);
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
             return 1;
         }
@@ -2255,13 +2300,7 @@ private:
             }
             return -1;
         }
-        // ⚠️⚠️ 内存泄漏根因(2026-09-14): QSV 异步 MFT 是"PROVIDES_SAMPLES"模式 —— 它把
-        // 输出样本指针写进 ob.pSample 交给调用方, **契约要求调用方负责 Release**。
-        // 老代码只拿 ConvertToContiguousBuffer 里的 buffer 用, ob.pSample 从未被释放
-        // → 每帧泄漏一个 ~3.3MB 的 IMFSample → 8400 帧(~190 秒)后提交内存耗尽 → bad_alloc。
-        // 这里必须用 ComPtr 接管引用, 作用域结束自动释放。(own 模式下 ob.pSample 就是
-        // own.Get(), 接管只是引用+1, 同样正确。)
-        ComPtr<IMFSample> outS = ob.pSample;
+        IMFSample *outS = ob.pSample;
         if (!outS) {
             if (dbgNoOut_++ < 10) {
                 Log("  [enc] ProcessOutput 成功但没有样本(忽略, 等下个事件, 第 %llu 次)",
@@ -2380,6 +2419,19 @@ public:
             len -= (size_t)n;
         }
         return true;
+    }
+
+    // Returns zero on a timeout and a negative value on disconnect or failure.
+    int ReadTouchBytes(uint8_t *data, int count)
+    {
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(fd_, &readable);
+        timeval timeout{0, 50000};
+        int ready = select(0, &readable, nullptr, nullptr, &timeout);
+        if (ready <= 0) return ready;
+        int n = recv(fd_, reinterpret_cast<char *>(data), count, 0);
+        return n > 0 ? n : -1;
     }
 
     void Close()
@@ -2531,16 +2583,18 @@ static bool IsDeviceLine(const std::string &line)
 }
 
 // 平板是否在线(既能插入也会因 hdc 启动失败而判否)。
-static bool HdcDevicePresent(const std::string &hdc)
+static bool HdcDevicePresent(const std::string &hdc, bool singleUsb = false)
 {
     if (hdc.empty()) {
         return false;
     }
     std::string out;
-    if (!RunCapture(hdc, "list targets", 4000, &out)) {
+    if (!RunCapture(hdc, singleUsb ? "list targets -v" : "list targets", 4000, &out)) {
         return false; // 超时/启动失败 => 视为不在线
     }
     size_t i = 0;
+    int connected = 0;
+    bool usb = false;
     while (i < out.size()) {
         size_t j = out.find('\n', i);
         if (j == std::string::npos) {
@@ -2552,10 +2606,24 @@ static bool HdcDevicePresent(const std::string &hdc)
             line.pop_back();
         }
         if (IsDeviceLine(line)) {
-            return true;
+            if (!singleUsb) return true;
+            char transport[32], state[32];
+            if (sscanf_s(line.c_str(), "%*s %31s %31s", transport, 32u, state, 32u) == 2 &&
+                strcmp(state, "Connected") == 0) {
+                ++connected;
+                usb = strcmp(transport, "USB") == 0;
+            }
         }
     }
-    return false;
+    return connected == 1 && usb;
+}
+
+static bool CreateFport(const std::string &hdc, int port)
+{
+    char command[128];
+    snprintf(command, sizeof(command), "fport tcp:%d tcp:%d", port, port);
+    std::string result;
+    return RunCapture(hdc, command, 4000, &result) && result.find("result:OK") != std::string::npos;
 }
 
 static void EnsureFport(const std::string &hdc, int port)
@@ -2564,11 +2632,10 @@ static void EnsureFport(const std::string &hdc, int port)
         return;
     }
     std::string dummy;
-    char a[128], b[128];
+    char a[128];
     snprintf(a, sizeof(a), "fport rm tcp:%d tcp:%d", port, port);
-    snprintf(b, sizeof(b), "fport tcp:%d tcp:%d", port, port);
     RunCapture(hdc, a, 4000, &dummy);
-    RunCapture(hdc, b, 4000, &dummy);
+    CreateFport(hdc, port);
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 }
 
@@ -3636,6 +3703,16 @@ public:
         return true;
     }
 
+    int OutputIndex() const
+    {
+        for (const auto &output : EnumOutputs()) {
+            if (output.deviceName == devName_) {
+                return output.index;
+            }
+        }
+        return -1;
+    }
+
     void Cleanup()
     {
         if (pingRun_.exchange(false)) {
@@ -4084,6 +4161,7 @@ struct Args
     int vddHz = 60;
     std::string side = "left"; // 虚拟显示器摆在外接屏的哪一侧
     bool watch = false;        // 插拔守护模式
+    bool touch = false;        // --touch: single-finger native input in USB watch mode
     int watchIntervalMs = 1000;
     int unplugDelayMs = 2000;
     bool launchApp = false;    // 检测到设备时尝试拉起平板端 App
@@ -4167,6 +4245,8 @@ static Args ParseArgs(int argc, char **argv)
         } else if (s == "--watch") {
             a.watch = true;
             a.vdd = true; // 守护模式必然用虚拟显示器
+        } else if (s == "--touch") {
+            a.touch = true;
         } else if (s == "--watch-interval") {
             a.watchIntervalMs = atoi(next().c_str());
             if (a.watchIntervalMs < 200) {
@@ -4288,6 +4368,94 @@ static int CalcKbps(const Args &args, int w, int h)
     return kbps;
 }
 
+static bool InjectContact(HSYNTHETICPOINTERDEVICE device, POINT position, UINT32 flags)
+{
+    POINTER_TYPE_INFO input{};
+    input.type = PT_TOUCH;
+    auto &contact = input.touchInfo;
+    contact.pointerInfo.pointerType = PT_TOUCH;
+    contact.pointerInfo.pointerId = 1;
+    // The synthetic pointer API expects coordinates from the virtual screen's top-left.
+    contact.pointerInfo.ptPixelLocation = {position.x - GetSystemMetrics(SM_XVIRTUALSCREEN),
+                                           position.y - GetSystemMetrics(SM_YVIRTUALSCREEN)};
+    contact.pointerInfo.pointerFlags = flags;
+    return InjectSyntheticPointerInput(device, &input, 1) != FALSE;
+}
+
+static void ReceiveTouch(TcpClient &tcp, const DupCapture &cap, const std::atomic<bool> &stop,
+                         std::atomic<bool> &streamDead)
+{
+    const auto previousDpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const auto device = CreateSyntheticPointerDevice(PT_TOUCH, 1, POINTER_FEEDBACK_NONE);
+    if (!device) {
+        Log("[触控] Windows 初始化失败 (%lu)", GetLastError());
+        if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
+        return;
+    }
+    TouchSequence sequence;
+    POINT last{};
+    bool injectedDown = false;
+    uint8_t message[5];
+    int received = 0;
+    while (!stop.load() && !streamDead.load() && !cap.ModeChanged()) {
+        const int n = tcp.ReadTouchBytes(message + received, static_cast<int>(sizeof(message)) - received);
+        if (n < 0) {
+            streamDead = true;
+            break;
+        }
+        received += n;
+        if (received != static_cast<int>(sizeof(message))) continue;
+        received = 0;
+        const auto action = static_cast<TouchAction>(message[0]);
+        if (!sequence.Accept(action)) {
+            Log("[触控] 触点顺序无效，结束当前输入通道 (action=%u)", message[0]);
+            break;
+        }
+        if (action == TouchAction::Up || action == TouchAction::Cancel) {
+            UINT32 flags = POINTER_FLAG_UP;
+            if (action == TouchAction::Cancel) flags |= POINTER_FLAG_CANCELED;
+            if (!InjectContact(device, last, flags)) {
+                Log("[触控] 释放触点失败 (Windows %lu)", GetLastError());
+                break;
+            }
+            injectedDown = false;
+            continue;
+        }
+
+        DEVMODEW mode{};
+        mode.dmSize = sizeof(mode);
+        if (!EnumDisplaySettingsExW(cap.DeviceName().c_str(), ENUM_CURRENT_SETTINGS, &mode, 0) ||
+            mode.dmDisplayOrientation != DMDO_DEFAULT || mode.dmPelsWidth != cap.FullWidth() ||
+            mode.dmPelsHeight != cap.FullHeight()) {
+            Log("[触控] 虚拟屏模式与采集尺寸不一致 (%lux%lu / %dx%d, rotation=%lu)", mode.dmPelsWidth,
+                mode.dmPelsHeight, cap.FullWidth(), cap.FullHeight(), mode.dmDisplayOrientation);
+            break;
+        }
+        POINT target{TouchPixel((message[1] << 8) | message[2], mode.dmPosition.x, mode.dmPelsWidth),
+                     TouchPixel((message[3] << 8) | message[4], mode.dmPosition.y, mode.dmPelsHeight)};
+        MONITORINFOEXW monitor{};
+        monitor.cbSize = sizeof(monitor);
+        if (!GetMonitorInfoW(MonitorFromPoint(target, MONITOR_DEFAULTTONULL), &monitor) ||
+            cap.DeviceName() != monitor.szDevice) {
+            Log("[触控] 坐标未命中当前虚拟屏 (%ls)", cap.DeviceName().c_str());
+            break;
+        }
+        UINT32 flags = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT |
+                       (action == TouchAction::Down ? POINTER_FLAG_DOWN : POINTER_FLAG_UPDATE);
+        if (!InjectContact(device, target, flags)) {
+            Log("[触控] 原生输入失败 (Windows %lu, action=%u, point=%ld,%ld)", GetLastError(), message[0],
+                target.x, target.y);
+            break;
+        }
+        if (action == TouchAction::Down) Log("[触控] Windows 已接受按下");
+        last = target;
+        injectedDown = true;
+    }
+    if (injectedDown) InjectContact(device, last, POINTER_FLAG_UP | POINTER_FLAG_CANCELED);
+    DestroySyntheticPointerDevice(device);
+    if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
+}
+
 // 跑一轮"捕获 → 编码 → 推流"。返回编码出的 AU 帧数; outBytes 返回发送字节数。
 // 结束条件: Ctrl+C / externalStop 被置位(守护模式下平板被拔出) / 达到 durationSec。
 static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int kbps,
@@ -4303,7 +4471,8 @@ static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int
     TcpClient tcp;
 
     auto stopped = [&]() {
-        return g_exit.load() || localStop.load() || (externalStop != nullptr && externalStop->load());
+        return g_exit.load() || localStop.load() || cap.ModeChanged() ||
+               (externalStop != nullptr && externalStop->load());
     };
 
     // 捕获线程
@@ -4323,6 +4492,9 @@ static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int
             }
             nextTick += interval;
             cap.Tick(8);
+            if (cap.ModeChanged()) {
+                break;
+            }
             if (cap.HasFrame()) {
                 FrameBuf f;
                 f.nv12.assign(cap.Nv12(), cap.Nv12() + (size_t)w * h * 3 / 2);
@@ -4405,9 +4577,6 @@ static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int
                     std::chrono::duration<double>(Clock::now() - tStart).count() >= durationSec) {
                     break;
                 }
-                if (cap.ModeChanged()) {
-                    break;
-                }
             }
             SetFeedTarget(nullptr);
             uint64_t commitBefore = ProbeCommitMB();
@@ -4435,8 +4604,10 @@ static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int
             continue;
         }
         Log("已连接, 发送握手...");
+        const bool touch = args.touch;
         char hello[128];
-        snprintf(hello, sizeof(hello), "{\"type\":\"hello\",\"width\":%d,\"height\":%d}", w, h);
+        snprintf(hello, sizeof(hello), "{\"type\":\"hello\",\"width\":%d,\"height\":%d%s}", w, h,
+                 touch ? ",\"touch\":1" : "");
         size_t hl = strlen(hello);
         uint8_t hdr[4] = {(uint8_t)(hl >> 24), (uint8_t)(hl >> 16), (uint8_t)(hl >> 8), (uint8_t)hl};
         if (!tcp.SendAll(hdr, 4) || !tcp.SendAll(hello, hl)) {
@@ -4463,6 +4634,12 @@ static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int
         }
         SetFeedTarget(enc.Queue());
         g_forceFrame = true;
+        std::atomic<bool> touchStop{false};
+        std::thread touchThread;
+        if (touch) {
+            touchThread = std::thread(ReceiveTouch, std::ref(tcp), std::cref(cap), std::cref(touchStop),
+                                      std::ref(streamDead));
+        }
 
         uint64_t lastBytes = 0, lastEnc = 0;
         uint64_t sMap = cap.MapUs(), sCur = cap.CurUs(), sConv = cap.ConvUs(), sN = cap.FrameN();
@@ -4505,7 +4682,7 @@ static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int
                 lastEnc = e;
                 lastStat = now;
             }
-            if (durationSec > 0 && std::chrono::duration<double>(now - tStream).count() >= durationSec) {
+            if (durationSec > 0 && std::chrono::duration<double>(now - tStart).count() >= durationSec) {
                 break;
             }
             if (args.sessionLifetimeSec > 0 &&
@@ -4515,12 +4692,10 @@ static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int
                          ProbeCommitMB());
                 break;
             }
-            if (cap.ModeChanged()) {
-                Log("分辨率已被改动, 结束本轮会话以便按新尺寸重建(守护模式会自动重建)");
-                break;
-            }
         }
         SetFeedTarget(nullptr);
+        touchStop = true;
+        if (touchThread.joinable()) touchThread.join();
         enc.Destroy();
         tcp.Close();
         if (stopped()) {
@@ -4536,6 +4711,40 @@ static uint64_t StreamUntil(const Args &args, DupCapture &cap, int w, int h, int
         *outBytes = sentBytes.load();
     }
     return totalAUs.load();
+}
+
+// Reopen capture on the same virtual display when Windows changes its mode.
+static uint64_t StreamVirtualDisplay(const Args &args, const VddDisplay &vdd, std::unique_ptr<DupCapture> cap,
+                                     int w, int h, const std::atomic<bool> *externalStop, int durationSec,
+                                     uint64_t *outBytes)
+{
+    const auto deadline = Clock::now() + std::chrono::seconds(durationSec);
+    uint64_t frames = 0;
+    *outBytes = 0;
+    while (!g_exit.load() && !(externalStop && externalStop->load())) {
+        auto remaining = std::chrono::ceil<std::chrono::seconds>(deadline - Clock::now()).count();
+        if (durationSec > 0 && remaining <= 0) {
+            break;
+        }
+        const int kbps = CalcKbps(args, w, h);
+        Log("开始推流 %d×%d@%d %dkbps → %s:%d", w, h, args.fps, kbps, args.host.c_str(), args.port);
+        uint64_t bytes = 0;
+        frames += StreamUntil(args, *cap, w, h, kbps, externalStop,
+                              durationSec > 0 ? static_cast<int>(remaining) : 0, &bytes);
+        *outBytes += bytes;
+        if (!cap->ModeChanged() || g_exit.load() || (externalStop && externalStop->load())) {
+            break;
+        }
+        cap.reset();
+        Log("虚拟显示器分辨率已更改，正在重建采集和编码");
+        const int index = vdd.OutputIndex();
+        cap = std::make_unique<DupCapture>();
+        if (index < 0 || !cap->Init(index, {}, args.scale, args.outW, args.outH, &w, &h)) {
+            Log("[错误] 无法按新分辨率重建采集");
+            break;
+        }
+    }
+    return frames;
 }
 
 // ============================ 插拔守护模式 ============================
@@ -4558,7 +4767,7 @@ static int WatchSession(const Args &args, const std::string &hdc)
 {
     // VddDisplay 必须先于 DupCapture 声明: 析构逆序保证先放开复制通道、再移除虚拟显示器
     VddDisplay vdd;
-    DupCapture cap;
+    auto cap = std::make_unique<DupCapture>();
 
     std::atomic<bool> deviceGone{false};
     std::atomic<bool> monStop{false};
@@ -4579,7 +4788,7 @@ static int WatchSession(const Args &args, const std::string &hdc)
             if (g_exit.load() || monStop.load()) {
                 return;
             }
-            if (HdcDevicePresent(hdc)) {
+            if (HdcDevicePresent(hdc, args.touch)) {
                 miss = 0;
                 continue;
             }
@@ -4592,7 +4801,7 @@ static int WatchSession(const Args &args, const std::string &hdc)
             if (g_exit.load() || monStop.load()) {
                 return;
             }
-            if (HdcDevicePresent(hdc)) {
+            if (HdcDevicePresent(hdc, args.touch)) {
                 miss = 0;
                 continue;
             }
@@ -4614,18 +4823,22 @@ static int WatchSession(const Args &args, const std::string &hdc)
         return 3;
     }
     int w = 0, h = 0;
-    if (!cap.Init(outIndex, args.source, args.scale, args.outW, args.outH, &w, &h)) {
+    if (!cap->Init(outIndex, args.source, args.scale, args.outW, args.outH, &w, &h)) {
         stopMon();
         return 3;
     }
-    int kbps = CalcKbps(args, w, h);
-    Log("开始推流 %d×%d@%d %dkbps → %s:%d (拔线即自动销毁, Ctrl+C 退出)", w, h, args.fps, kbps,
-        args.host.c_str(), args.port);
 
     uint64_t bytes = 0;
-    uint64_t aus = StreamUntil(args, cap, w, h, kbps, &deviceGone, 0, &bytes);
+    uint64_t aus = 0;
+    if (args.source.empty()) {
+        aus = StreamVirtualDisplay(args, vdd, std::move(cap), w, h, &deviceGone, 0, &bytes);
+    } else {
+        const int kbps = CalcKbps(args, w, h);
+        Log("开始推流 %d×%d@%d %dkbps → %s:%d", w, h, args.fps, kbps, args.host.c_str(), args.port);
+        aus = StreamUntil(args, *cap, w, h, kbps, &deviceGone, 0, &bytes);
+        cap->Shutdown();
+    }
     stopMon();
-    cap.Shutdown(); // 先放开捕获通道, vdd 析构才能安全移除虚拟显示器
     Log("会话结束: 编码 %llu 帧, 发送 %.1f MB", (unsigned long long)aus, (double)bytes / 1024 / 1024);
     return 0;
 }
@@ -4646,7 +4859,7 @@ static int WatchLoop(const Args &args)
     bool online = false;
     int failRun = 0;
     while (!g_exit.load()) {
-        if (!HdcDevicePresent(hdc)) {
+        if (!HdcDevicePresent(hdc, args.touch)) {
             if (online) {
                 Log("平板已拔出");
                 online = false;
@@ -4654,6 +4867,10 @@ static int WatchLoop(const Args &args)
             failRun = 0;
             SleepInterruptible(args.watchIntervalMs);
             continue;
+        }
+        if (FportActive(hdc, args.port)) {
+            Log("[错误] tcp:%d 已有 HDC 转发，守护模式退出", args.port);
+            return 3;
         }
         if (!online) {
             Log("检测到平板, 建立链路...");
@@ -4664,20 +4881,19 @@ static int WatchLoop(const Args &args)
                 RunCapture(hdc, "shell aa start -a EntryAbility -b com.example.subscreen", 8000, &o);
             }
         }
-        EnsureFport(hdc, args.port);
-        if (!FportActive(hdc, args.port)) {
+        if (!CreateFport(hdc, args.port)) {
             Log("[警告] fport 未就绪, 稍后重试");
             SleepInterruptible(args.watchIntervalMs);
             continue;
         }
 
         int rc = WatchSession(args, hdc);
+        RemoveFport(hdc, args.port);
         if (g_exit.load()) {
             break;
         }
-        RemoveFport(hdc, args.port);
 
-        bool stillThere = HdcDevicePresent(hdc);
+        bool stillThere = HdcDevicePresent(hdc, args.touch);
         if (!stillThere && online) {
             Log("平板已拔出");
             online = false;
@@ -5429,6 +5645,11 @@ int main(int argc, char **argv)
     WSADATA wsa{};
     WSAStartup(MAKEWORD(2, 2), &wsa);
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
+    if (args.touch && (!args.watch || args.gui || args.nohdc || args.noEncode || args.noNet ||
+                       !args.source.empty() || args.host != "127.0.0.1")) {
+        Log("[错误] --touch 仅用于本机 HDC 转发的 USB 虚拟扩展屏守护模式");
+        return 3;
+    }
 
     // 无参数(双击 exe) = 打开可视化窗口。带任何参数时保持原来的命令行行为。
     if (args.gui || argc <= 1) {
@@ -5528,7 +5749,7 @@ int main(int argc, char **argv)
     // 单次会话。VddDisplay 必须声明在 DupCapture 之前: 析构逆序保证先放开捕获通道、
     // 再移除虚拟显示器(否则 DXGI 复制通道会指向一个已消失的输出)。
     VddDisplay vdd;
-    DupCapture cap;
+    auto cap = std::make_unique<DupCapture>();
     int w = 0, h = 0;
     int outIndex = args.output;
     if (args.vdd) {
@@ -5545,22 +5766,21 @@ int main(int argc, char **argv)
             return 3;
         }
     }
-    if (!cap.Init(outIndex, args.vdd ? std::string() : args.source, args.scale, args.outW, args.outH, &w,
-                  &h)) {
+    if (!cap->Init(outIndex, args.vdd ? std::string() : args.source, args.scale, args.outW, args.outH, &w,
+                   &h)) {
         return 3;
     }
-    int kbps = CalcKbps(args, w, h);
 
     // ---- 诊断: --dump <前缀> ----
     // 把"送进编码器的那一帧 NV12"和"它之前的 BGRA"原样导出, 然后退出(不建 fport、不推流)。
     // 目的: 把整条管线切成"发送端内部 / 发送端之后"两段 —— 用 Python 把两者都还原成图片对照,
     // 就能判断颜色问题是本地就存在, 还是编码器/平板解码器引入的。
     if (!args.dump.empty()) {
-        for (int i = 0; i < 300 && !cap.HasFrame() && !g_exit.load(); i++) {
-            cap.ForceDirty();
-            cap.Tick(50);
+        for (int i = 0; i < 300 && !cap->HasFrame() && !g_exit.load(); i++) {
+            cap->ForceDirty();
+            cap->Tick(50);
         }
-        if (!cap.HasFrame()) {
+        if (!cap->HasFrame()) {
             Log("[错误] --dump: 等不到可用的帧");
             return 3;
         }
@@ -5568,16 +5788,16 @@ int main(int argc, char **argv)
         {
             FILE *f = fopen((base + ".nv12").c_str(), "wb");
             if (f) {
-                fwrite(cap.Nv12(), 1, (size_t)w * h * 3 / 2, f);
+                fwrite(cap->Nv12(), 1, (size_t)w * h * 3 / 2, f);
                 fclose(f);
             } else {
                 Log("[错误] 无法写入 %s.nv12", base.c_str());
             }
         }
-        if (cap.HasBgra()) {
+        if (cap->HasBgra()) {
             FILE *f = fopen((base + ".bgra").c_str(), "wb");
             if (f) {
-                fwrite(cap.Bgra(), 1, (size_t)cap.FullWidth() * cap.FullHeight() * 4, f);
+                fwrite(cap->Bgra(), 1, (size_t)cap->FullWidth() * cap->FullHeight() * 4, f);
                 fclose(f);
             }
         } else {
@@ -5586,12 +5806,12 @@ int main(int argc, char **argv)
         {
             FILE *f = fopen((base + ".txt").c_str(), "w");
             if (f) {
-                fprintf(f, "%d %d %d %d\n", w, h, cap.FullWidth(), cap.FullHeight());
+                fprintf(f, "%d %d %d %d\n", w, h, cap->FullWidth(), cap->FullHeight());
                 fclose(f);
             }
         }
         Log("已导出一帧: %s.nv12 (推流 %dx%d) + %s.bgra (桌面 %dx%d)", base.c_str(), w, h, base.c_str(),
-            cap.FullWidth(), cap.FullHeight());
+            cap->FullWidth(), cap->FullHeight());
         return 0;
     }
 
@@ -5605,18 +5825,21 @@ int main(int argc, char **argv)
         }
     }
 
-    Log("开始推流 %d×%d@%d %dkbps → %s:%d (Ctrl+C 退出)", w, h, args.fps, kbps, args.host.c_str(),
-        args.port);
-
     uint64_t bytes = 0;
-    uint64_t totalAUs = StreamUntil(args, cap, w, h, kbps, nullptr, args.duration, &bytes);
-    bool modeChanged = cap.ModeChanged(); // Shutdown 会清掉这个标志, 先取出来
-    cap.Shutdown();                       // 先放开捕获通道, vdd 析构才能安全移除虚拟显示器
+    uint64_t totalAUs = 0;
+    if (args.vdd) {
+        totalAUs = StreamVirtualDisplay(args, vdd, std::move(cap), w, h, nullptr, args.duration, &bytes);
+    } else {
+        int kbps = CalcKbps(args, w, h);
+        Log("开始推流 %d×%d@%d %dkbps → %s:%d (Ctrl+C 退出)", w, h, args.fps, kbps, args.host.c_str(), args.port);
+        totalAUs = StreamUntil(args, *cap, w, h, kbps, nullptr, args.duration, &bytes);
+        if (cap->ModeChanged()) {
+            Log("[提示] 显示器分辨率在运行中被改动。重新运行本程序即可按新尺寸推流");
+        }
+        cap->Shutdown();
+    }
 
     Log("结束: 编码 %llu 帧, 发送 %.1f MB", (unsigned long long)totalAUs, (double)bytes / 1024 / 1024);
-    if (modeChanged) {
-        Log("[提示] 显示器分辨率在运行中被改动。重新运行本程序(或改用 --watch)即可按新尺寸推流");
-    }
 
     if (!args.nohdc && !hdc.empty()) {
         RemoveFport(hdc, args.port);

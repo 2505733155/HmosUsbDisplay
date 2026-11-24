@@ -59,6 +59,11 @@ bool VideoDecoder::Start(int width, int height, OHNativeWindow *window)
         err = OH_VideoDecoder_SetSurface(codec_, window); // Surface 模式：输出直送显示
     }
     if (err == AV_ERR_OK) {
+        // Preserve the desktop aspect ratio when it differs from the tablet screen.
+        int32_t scalingError = OH_NativeWindow_NativeWindowSetScalingModeV2(window, OH_SCALING_MODE_SCALE_FIT_V2);
+        if (scalingError != 0) {
+            LOGE("aspect-fit scaling setup failed, err=%{public}d", scalingError);
+        }
         err = OH_VideoDecoder_Start(codec_);
     }
     if (err != AV_ERR_OK) {

@@ -2,7 +2,7 @@
 
 通过 USB 数据线把鸿蒙平板用作 Windows 的独立扩展屏。Windows 发送端创建 Parsec 虚拟显示器，将其画面编码为 H.264，经华为 HDC 的 USB 转发通道发给平板端 SubScreen。
 
-已在 Windows 11 25H2 和 HarmonyOS 7.0.0.111 SP18 的 LRT-W20 平板上完成 1920×1080 短时真机验证。Intel Quick Sync 编码时发送进程的提交内存持续增长，长时间运行仍待验证。详见[真机验证记录](docs/usb-verification.md)。
+已在 Windows 11 25H2 和 HarmonyOS 7.0.0.111 SP18 的 LRT-W20 平板上完成 1920×1080、约 25 fps 的 30 分钟连续运行，验证了拔插恢复、等比显示、鼠标指针以及切换到 2560×1440 后恢复推流。[真机验证记录](docs/usb-verification.md)
 
 ## 目录
 
@@ -10,7 +10,7 @@
 | --- | --- |
 | `pc/` | Windows 发送端、构建脚本和诊断工具 |
 | `harmony/` | 原生鸿蒙接收端和公开的构建配置模板 |
-| `docs/usb-verification.md` | 短时真机结果和已知限制 |
+| `docs/` | 真机验证、阶段记录和本地证据备份说明 |
 | `workboard.html` | 项目任务看板，可在本地浏览器打开 |
 
 ## 构建 Windows 发送端
@@ -55,6 +55,30 @@ try {
 ```
 
 ## 验证 USB 扩展屏
+
+日常使用时，双击 `pc/start-watch.cmd` 启动 USB 守护模式。平板插上后自动尝试打开 SubScreen 并创建扩展屏。首次使用默认请求 1920×1080、25 fps，之后沿用上一次使用的显示分辨率。可以在 Windows 显示设置里调整这块虚拟屏，画面会在发送端按新尺寸重建会话后恢复。拔线或在守护窗口按 **Ctrl+C** 会回收虚拟显示器和本次创建的转发。如果 Windows 提示终止批处理，按 **Y**。
+
+如果 DevEco Studio 装在自定义目录，从 PowerShell 启动时用 `--hdc` 指定工具的完整路径。
+
+```powershell
+$devEco = Read-Host 'DevEco Studio 安装目录'
+$hdc = Join-Path $devEco 'sdk\default\openharmony\toolchains\hdc.exe'
+& .\pc\start-watch.cmd --hdc $hdc
+```
+
+### Windows 原生触控试用
+
+同时更新 Windows 发送端和鸿蒙接收端后，启动守护模式时加 `--touch`。本机已配置的启动脚本用法如下。
+
+```powershell
+& .\.local\start-subscreen.cmd --touch
+```
+
+本机也可在 VS Code 中通过 `Tasks: Run Task` 运行「SubScreen：试用单指触控」。保留本机启动脚本及历史试验材料的路径见[阶段清理记录](docs/daily-use-cleanup.md)。
+
+触控仅在明确开启、只有一台通过 USB 连接的 HDC 设备且虚拟屏为横向时生效。单指点按和拖动作为 Windows 原生触点发送到虚拟屏，已在本机通过鸿蒙平板自动测试和手动复核。发送端会忽略从黑边开始的触点，并在 USB 断开时释放正在进行的触点。触点释放和旧接收端兼容性仍待回归验证。[真机验证记录](docs/usb-verification.md)
+
+### 20 秒真机检查
 
 在平板打开已安装的 SubScreen。用支持数据传输的 USB 线连接两端，确认 `hdc list targets -v` 显示预期平板为 `USB`、`Connected`。以下命令会运行一次 20 秒的 1920×1080 扩展屏测试。测试期间，把一个 Windows 测试窗口移到新增的显示器，在平板上核对画面。
 

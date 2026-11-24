@@ -23,5 +23,6 @@ target_link_libraries(subscreen PUBLIC
     libnative_media_vdec.so
     libnative_media_codecbase.so
     libnative_media_core.so
+    libnative_window.so
     libhilog_ndk.z.so
 )

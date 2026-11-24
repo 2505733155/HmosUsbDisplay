@@ -2,8 +2,10 @@
 #include <hilog/log.h>
 #include <napi/native_api.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -83,6 +85,8 @@ struct Pipeline {
     bool windowReady = false;
     bool gotHello = false;
     bool clientConnected = false;
+    bool touchEnabled = false;
+    int32_t touchId = -1;
     int32_t streamW = 0;
     int32_t streamH = 0;
 
@@ -97,7 +101,7 @@ Pipeline g_pipeline;
 std::thread g_statsThread;
 std::atomic<bool> g_statsRunning{false};
 
-bool ParseHello(const uint8_t *data, size_t len, int32_t *width, int32_t *height)
+bool ParseHello(const uint8_t *data, size_t len, int32_t *width, int32_t *height, bool *touchEnabled)
 {
     std::string text(reinterpret_cast<const char *>(data), len);
     if (text.find("hello") == std::string::npos) {
@@ -119,6 +123,8 @@ bool ParseHello(const uint8_t *data, size_t len, int32_t *width, int32_t *height
         *out = static_cast<int32_t>(v);
         return true;
     };
+    int32_t touchVersion = 0;
+    *touchEnabled = findNum("\"touch\"", &touchVersion) && touchVersion == 1;
     return findNum("\"width\"", width) && findNum("\"height\"", height);
 }
 
@@ -154,12 +160,12 @@ void OnPacket(const uint8_t *data, size_t len)
     if (!p.gotHello) {
         int32_t w = 0;
         int32_t h = 0;
-        if (ParseHello(data, len, &w, &h)) {
+        if (ParseHello(data, len, &w, &h, &p.touchEnabled)) {
             p.streamW = w;
             p.streamH = h;
             p.gotHello = true;
             StartDecoderLocked();
-            LOG("hello: %{public}dx%{public}d", w, h);
+            LOG("hello: %{public}dx%{public}d touch=%{public}d", w, h, p.touchEnabled);
         }
         return; // 非 hello 包在握手前一律忽略
     }
@@ -179,6 +185,8 @@ void OnClientState(bool connected)
     p.clientConnected = connected;
     LOG("client %{public}s", connected ? "connected" : "disconnected");
     if (!connected) {
+        p.touchId = -1;
+        p.touchEnabled = false;
         StopDecoderLocked();
         p.gotHello = false; // 新连接重新握手
     }
@@ -201,6 +209,11 @@ void OnSurfaceDestroyed()
     Pipeline &p = g_pipeline;
     std::lock_guard<std::mutex> lock(p.mtx);
     LOG("surface destroyed");
+    if (p.touchId != -1) {
+        const uint8_t cancel[5]{3};
+        p.server.SendTouch(cancel);
+        p.touchId = -1;
+    }
     StopDecoderLocked();
     p.window = nullptr;
     p.windowReady = false;
@@ -332,7 +345,53 @@ void OnSurfaceDestroyedCb(OH_NativeXComponent *component, void *window)
     OnSurfaceDestroyed();
 }
 
-void DispatchTouchCb(OH_NativeXComponent *component, void *window) {}
+void DispatchTouchCb(OH_NativeXComponent *component, void *window)
+{
+    OH_NativeXComponent_TouchEvent event{};
+    uint64_t width = 0, height = 0;
+    if (OH_NativeXComponent_GetTouchEvent(component, window, &event) != 0 ||
+        OH_NativeXComponent_GetXComponentSize(component, window, &width, &height) != 0 ||
+        width == 0 || height == 0) return;
+
+    auto &p = g_pipeline;
+    std::lock_guard<std::mutex> lock(p.mtx);
+    if (!p.touchEnabled || !p.gotHello || !p.decoder || !p.decoder->framesDecoded.load()) return;
+    const double scale = std::min(static_cast<double>(width) / p.streamW, static_cast<double>(height) / p.streamH);
+    const double contentW = p.streamW * scale, contentH = p.streamH * scale;
+    const double x = (event.x - (width - contentW) / 2) / contentW;
+    const double y = (event.y - (height - contentH) / 2) / contentH;
+    uint8_t message[5]{};
+    if (event.type == OH_NATIVEXCOMPONENT_DOWN) {
+        if (p.touchId != -1 || event.numPoints != 1 || !(x >= 0 && x < 1 && y >= 0 && y < 1)) {
+            LOG("touch down ignored: contacts=%{public}u inside=%{public}d", event.numPoints,
+                x >= 0 && x < 1 && y >= 0 && y < 1);
+            return;
+        }
+        p.touchId = event.id;
+    } else {
+        if (p.touchId != event.id) return;
+        if (event.type == OH_NATIVEXCOMPONENT_MOVE) {
+            message[0] = 1;
+        } else if (event.type == OH_NATIVEXCOMPONENT_UP || event.type == OH_NATIVEXCOMPONENT_CANCEL) {
+            message[0] = event.type == OH_NATIVEXCOMPONENT_UP ? 2 : 3;
+            p.touchId = -1;
+            p.server.SendTouch(message);
+            return;
+        } else {
+            return;
+        }
+    }
+    if (!std::isfinite(x) || !std::isfinite(y)) return;
+    const uint16_t nx = static_cast<uint16_t>(std::clamp(x, 0.0, 1.0) * 65535);
+    const uint16_t ny = static_cast<uint16_t>(std::clamp(y, 0.0, 1.0) * 65535);
+    message[1] = nx >> 8;
+    message[2] = nx & 0xff;
+    message[3] = ny >> 8;
+    message[4] = ny & 0xff;
+    const bool sent = p.server.SendTouch(message);
+    if (event.type == OH_NATIVEXCOMPONENT_DOWN) LOG("touch down forwarded=%{public}d", sent);
+    if (!sent) p.touchId = -1;
+}
 
 napi_value Init(napi_env env, napi_value exports)
 {

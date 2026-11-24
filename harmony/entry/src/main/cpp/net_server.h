@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -19,12 +20,15 @@ public:
     bool Start(uint16_t port, PacketHandler onPacket, StateHandler onState);
     void Stop();
     bool IsRunning() const { return running_.load(); }
+    bool SendTouch(const uint8_t (&message)[5]);
 
 private:
     void Run();
     void ClientLoop(int clientFd);
 
     int listenFd_ = -1;
+    std::mutex clientMutex_;
+    int clientFd_ = -1;
     int stopPipe_[2] = {-1, -1};
     std::atomic<bool> running_{false};
     std::thread thread_;

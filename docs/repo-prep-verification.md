@@ -4,7 +4,7 @@
 
 ## 材料
 
-- [项目说明](README.md)、[工作看板](workboard.html)、[真机验证记录](docs/usb-verification.md)和 [MIT 许可证](LICENSE)。
+- [项目说明](../README.md)、[工作看板](../workboard.html)、[真机验证记录](usb-verification.md)和 [MIT 许可证](../LICENSE)。
 - Windows 发送端位于 `pc/`。鸿蒙接收端位于 `harmony/`，公开配置模板为 `harmony/build-profile.example.json5`。
 - 本机校验材料位于 `.local/`。原始上游 ZIP 位于 `.local/upstream/SubScreen-source.zip`，截图、日志及清理记录位于 `.local/evidence/2026-11-24/`。
 

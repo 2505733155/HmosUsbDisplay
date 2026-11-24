@@ -36,10 +36,10 @@
 {
   "meta": {
     "title": "HmosUsbDisplay 任务看板",
-    "description": "将鸿蒙平板通过 USB 用作 Windows 扩展屏。公开仓库准备已收尾，后续将验证长时间运行和日常启动。",
+    "description": "将鸿蒙平板通过 USB 用作 Windows 扩展屏。日常使用阶段已收尾，下一阶段计划实现多点触控。",
     "projectRoot": "./",
     "storageKey": "hmos-usb-display",
-    "currentTaskId": null
+    "currentTaskId": "multi-touch"
   },
   "statuses": {
     "skipped": {
@@ -59,7 +59,7 @@
       "evidence": [
         {
           "label": "公开仓库准备独立核验要求",
-          "path": "REPO-PREP-VERIFY.md"
+          "path": "docs/repo-prep-verification.md"
         },
         {
           "label": "USB 扩展屏真机验证记录",
@@ -71,16 +71,29 @@
       "id": "daily-use",
       "name": "稳定性与日常使用",
       "environment": "Windows 25H2，LRT-W20 平板，HarmonyOS 7.0.0.111 SP18（API 26），双头 USB-C 数据线。",
-      "state": "未开始",
-      "summary": "以已经跑通的 USB 扩展屏为基线，定位 Windows 编码内存增长，完成长测后简化启动。",
-      "acceptance": "长时间测试符合验收条件，一键启动和退出回收通过独立核验及用户审阅。",
-      "pending": "后续复测编码路径并记录内存与帧率数据。",
+      "state": "已收尾",
+      "summary": "已完成编码内存修复、USB 长测和日常启动验证。Windows 原生单指点按与拖动已通过平板自动测试和手动复核。",
+      "acceptance": "用户试用 USB 扩展屏和单指触控后，反馈是否满足日常使用，记录遇到的问题。",
+      "pending": "用户确认试用通过，跳过经验整理。终端 UTF-8 已通过命令探测，实际任务显示留待日常使用观察。历史桌面卡死根因仍待确认，高帧率研究暂缓。",
       "evidence": [
         {
           "label": "USB 扩展屏真机验证记录",
           "path": "docs/usb-verification.md"
+        },
+        {
+          "label": "日常使用阶段清理与备份记录",
+          "path": "docs/daily-use-cleanup.md"
         }
       ]
+    },
+    {
+      "id": "extended-features",
+      "name": "扩展性功能",
+      "environment": "现有 Windows 发送端、鸿蒙接收端与 USB 回传链路。",
+      "state": "待开始",
+      "summary": "首项任务是在已通过试用的单指触控基础上实现多点触控。",
+      "acceptance": "实际平板可在支持触屏手势的 Windows 应用中双指捏合缩放，单指操作继续可用。",
+      "pending": "待开始多点触控实现与验证。"
     }
   ],
   "sources": [
@@ -98,7 +111,7 @@
     },
     {
       "label": "公开仓库准备独立核验要求",
-      "path": "REPO-PREP-VERIFY.md"
+      "path": "docs/repo-prep-verification.md"
     }
   ],
   "tasks": [
@@ -124,7 +137,7 @@
         },
         {
           "label": "公开仓库准备独立核验要求",
-          "path": "REPO-PREP-VERIFY.md"
+          "path": "docs/repo-prep-verification.md"
         }
       ]
     },
@@ -137,13 +150,13 @@
       "deps": [
         "repo-organize"
       ],
-      "description": "原计划在新对话中按 REPO-PREP-VERIFY.md 做独立核验。用户确认本阶段跳过此项。",
+      "description": "原计划在新对话中按 docs/repo-prep-verification.md 做独立核验。用户确认本阶段跳过此项。",
       "acceptance": "记录独立核验发现、修正和复核结果。",
       "updatedAt": "2026-11-24",
       "evidence": [
         {
           "label": "公开仓库准备独立核验要求",
-          "path": "REPO-PREP-VERIFY.md"
+          "path": "docs/repo-prep-verification.md"
         }
       ]
     },
@@ -200,12 +213,14 @@
       "stage": "daily-use",
       "parent": null,
       "title": "定位发送端内存增长",
-      "status": "todo",
+      "status": "done",
       "deps": [
         "repo-organize"
       ],
       "description": "复现 Intel Quick Sync 路径中的提交内存增长。分别观察屏幕采集与 H.264 编码，记录可用替代路径的结果。真机短测中 NVIDIA 编码器激活失败后回退到 Intel。",
       "acceptance": "有可复现的数据定位增长环节，并记录确认可用的对照路径。",
+      "verification": "在 1920×1080、25 fps 的同一虚拟显示器上，只采集时约 59 MiB。启用 Intel Quick Sync 后，每 2 秒增长约 120 MiB。确认 Media Foundation 提供的输出样本引用未被接管。",
+      "updatedAt": "2026-11-24",
       "evidence": [
         {
           "label": "USB 扩展屏真机验证记录",
@@ -218,84 +233,207 @@
       "stage": "daily-use",
       "parent": null,
       "title": "稳定 Windows 编码路径",
-      "status": "todo",
+      "status": "done",
       "deps": [
         "memory-diagnose"
       ],
       "description": "依据诊断结果修正持续增长，或验证一条可替代的稳定编码路径。",
-      "acceptance": "预热后提交内存趋稳，Windows 能持续发送可被鸿蒙端解码的画面。"
+      "acceptance": "预热后提交内存趋稳，Windows 能持续发送可被鸿蒙端解码的画面。",
+      "verification": "修正编码器输出样本和事件的引用所有权。Windows 本机运行约 90 秒编码 2,212 帧，预热后约 244 MiB。USB 短测中 Windows 编码 460 帧，平板解码 459 帧，预热后约 245 MiB。退出后回收虚拟显示器与临时转发。",
+      "updatedAt": "2026-11-24",
+      "evidence": [
+        {
+          "label": "编码内存与 USB 回归记录",
+          "path": "docs/usb-verification.md"
+        }
+      ]
     },
     {
       "id": "tablet-long-run",
       "stage": "daily-use",
       "parent": null,
       "title": "真机连续运行与重连测试",
-      "status": "todo",
+      "status": "done",
       "deps": [
         "memory-stabilize"
       ],
-      "description": "在当前平板以 1920×1080、25–30 fps 连续运行 30–60 分钟。检查帧率、提交内存、持续更新与拔线重连。",
-      "acceptance": "记录测试时长和内存曲线，确认画面持续更新、拔线重连恢复以及退出回收显示器。"
+      "description": "在当前平板以 1920×1080、25–30 fps 连续运行 30–60 分钟。检查帧率、提交内存、持续更新与拔线重连，并复测鼠标指针。",
+      "acceptance": "记录测试时长和内存曲线，确认画面持续更新、指针可见、拔线重连恢复以及退出回收显示器。",
+      "verification": "首次启动遇到锁屏错误 10106102。解锁后旧版运行约 8 分 43 秒，随后因切换桌面重测。用户确认新版指针可见。旧发流逻辑在切换分辨率后仍用旧尺寸重连，已修复并实测从 1920×1080 切换至 2560×1440 后恢复。等比显示通过数字截图验证，用户确认 USB 拔插后自动恢复画面。最后一轮在 1920×1080 连续采样 30 分 27 秒，平均 25.00 fps，提交内存约 326–330 MiB，平板解码 45,137 帧。正常退出后回收虚拟屏与临时转发。",
+      "updatedAt": "2026-11-24",
+      "evidence": [
+        {
+          "label": "扩展屏鼠标指针验证记录",
+          "path": "docs/usb-verification.md"
+        }
+      ]
     },
     {
       "id": "one-click-start",
       "stage": "daily-use",
       "parent": null,
       "title": "封装 Windows 一键启动",
-      "status": "todo",
+      "status": "done",
       "deps": [
         "tablet-long-run"
       ],
       "description": "提供统一入口建立 HDC 转发、启动独立扩展屏和退出清理，并记录依赖位置与使用方法。",
-      "acceptance": "在当前设备上验证启动、停止和重复启动，核对临时转发及虚拟显示器的回收。"
+      "acceptance": "在当前设备上验证启动、停止和重复启动，核对临时转发及虚拟显示器的回收。",
+      "verification": "已配置 pc/start-watch.cmd 和本机入口 .local/start-subscreen.cmd。连续两次通过本机入口启动、停止并恢复双屏，平板均成功解码。重复启动的冲突测试确认已有 HDC 转发保留。",
+      "updatedAt": "2026-11-24",
+      "evidence": [
+        {
+          "label": "日常启动与退出记录",
+          "path": "docs/usb-verification.md"
+        }
+      ]
     },
     {
-      "id": "daily-verify",
+      "id": "refresh-rate-research",
       "stage": "daily-use",
       "parent": null,
-      "title": "独立核验与修正",
-      "status": "todo",
+      "title": "研究调整和提高扩展屏刷新率",
+      "status": "skipped",
       "deps": [
         "one-click-start"
       ],
-      "description": "在项目根目录整理稳定性、重连、启动与回收的核验要求，提供提示请用户在新对话进行独立核验。",
-      "acceptance": "记录独立核验、修正和复核结果。"
+      "description": "分别核对 Windows 虚拟屏可选刷新率、发送端编码帧率和平板实际解码与显示帧率。以已验证的 1920×1080、25 fps 为基线，评估更高帧率下的清晰度、延迟、丢帧和资源占用。",
+      "acceptance": "记录当前设备可选择的刷新率、可稳定达到的端到端帧率和主要限制，并给出已验证的配置。",
+      "verification": "平板当前为 60 Hz。1920×1200 内屏对照目标 30、45、60 fps 时，平板平均分别解码约 18.9、22.8、23.8 fps。1280×800 对照达到约 36.9 fps。真扩展屏的 Parsec 创建请求已被驱动接受，但 Windows 未出现独立 DXGI 输出。按用户决定暂缓复测和优化，优先实现触控。",
+      "evidence": [
+        {
+          "label": "1920×1080 真机运行基线",
+          "path": "docs/usb-verification.md"
+        }
+      ],
+      "updatedAt": "2026-11-24"
     },
     {
-      "id": "daily-review",
+      "id": "touch-input-research",
       "stage": "daily-use",
       "parent": null,
-      "title": "用户审阅",
-      "status": "todo",
+      "title": "研究用平板触屏操作 Windows 扩展屏",
+      "status": "done",
       "deps": [
-        "daily-verify"
+        "one-click-start"
       ],
-      "description": "请用户试用稳定后的一键入口并审阅测试记录，处理反馈。",
-      "acceptance": "用户明确确认本阶段审阅完成。"
+      "description": "研究鸿蒙端触摸事件采集、触点经当前 USB 连接回传、Windows 接收输入的可行性。优先验证单指点击和拖动，核对等比显示黑边与分辨率变化时的坐标映射，再评估多点触控。",
+      "acceptance": "给出可行性结论和所需的系统权限、协议改动及限制。条件具备时，用最小原型验证单指点击和拖动。",
+      "verification": "隔离诊断包在 Windows 上记录了通过 HDC 回传的真实单指点按和拖动。等比坐标映射及黑边检查通过。Windows 触控 API 初始化通过，向常规应用派发触控事件属于后续正式实现。测试转发已移除，平板原版已恢复。",
+      "evidence": [
+        {
+          "label": "平板触屏回传可行性记录",
+          "path": "docs/usb-verification.md"
+        }
+      ],
+      "updatedAt": "2026-11-24"
+    },
+    {
+      "id": "touch-input-implementation",
+      "stage": "daily-use",
+      "parent": null,
+      "title": "实现并验证 Windows 原生单指触控",
+      "status": "done",
+      "deps": [
+        "touch-input-research"
+      ],
+      "description": "在 USB 虚拟扩展屏守护模式中通过 --touch 显式启用。接收端将画面内的单指事件写回当前连接，发送端将触点映射到同一虚拟屏并调用 Windows 原生触控 API。",
+      "acceptance": "通过 --touch 启用原生单指触控，实际平板的点按和拖动能操作 Windows 测试窗口。",
+      "verification": "Windows 和鸿蒙构建通过。改用合成指针 API 后，1920×1080 只采集测试采集 100 帧。平板自动和用户手动两轮均收到原生点按和拖动，测试转发已清理，原显示布局已恢复，新版 HAP 已保留。早期两轮在采集初始化阶段发生桌面卡死，根因仍待确认。",
+      "evidence": [
+        {
+          "label": "原生触控和显示路径诊断",
+          "path": "docs/usb-verification.md"
+        },
+        {
+          "label": "只采集测试日志",
+          "path": ".local/daily-tests/capture-only-213440/crash_probe.log"
+        },
+        {
+          "label": "自动触控手势日志",
+          "path": ".local/daily-tests/touch-probe/native-213532/gestures.log"
+        },
+        {
+          "label": "手动触控手势日志",
+          "path": ".local/daily-tests/touch-probe/native-213715/gestures.log"
+        }
+      ],
+      "updatedAt": "2026-11-24"
+    },
+    {
+      "id": "daily-trial",
+      "stage": "daily-use",
+      "parent": null,
+      "title": "用户试用",
+      "status": "done",
+      "deps": [
+        "touch-input-implementation"
+      ],
+      "description": "在 VS Code 中运行「SubScreen：试用单指触控」，通过本机启动脚本开启 USB 扩展屏和单指点按、拖动。试用后在当前对话反馈使用感受和遇到的问题。",
+      "acceptance": "收到用户对日常使用的反馈，记录反馈和待处理问题。",
+      "verification": "用户确认试用通过。任务终端乱码已调整为启动前切换到 UTF-8，命令探测确认代码页 65001，实际任务显示待观察。",
+      "updatedAt": "2026-11-24",
+      "evidence": [
+        {
+          "label": "日常启动与触控说明",
+          "path": "README.md"
+        },
+        {
+          "label": "VS Code 单指触控试用任务",
+          "path": ".vscode/tasks.json"
+        }
+      ]
     },
     {
       "id": "daily-lessons",
       "stage": "daily-use",
       "parent": null,
       "title": "经验整理与复用（可选）",
-      "status": "todo",
+      "status": "skipped",
       "deps": [
-        "daily-review"
+        "daily-trial"
       ],
       "description": "询问一次是否整理稳定性排查和日常启动中可复用的经验。",
-      "acceptance": "记录用户选择、复用范围及保存位置，或记录本阶段跳过。"
+      "acceptance": "记录用户选择、复用范围及保存位置，或记录本阶段跳过。",
+      "verification": "用户明确要求跳过。",
+      "updatedAt": "2026-11-24"
     },
     {
       "id": "daily-close",
       "stage": "daily-use",
       "parent": null,
       "title": "全工作目录检查与清理",
-      "status": "todo",
+      "status": "done",
       "deps": [
         "daily-lessons"
       ],
       "description": "复查本阶段留下的采样文件、缓存和临时产物，保留交付物与必要证据。",
-      "acceptance": "完成全目录复查，记录收尾清理结果。"
+      "acceptance": "完成全目录复查，记录收尾清理结果。",
+      "verification": "复查含忽略项，按新清单移除 68 个构建中间文件和缓存，共 9,613,485 字节。原始试验、失败记录、回滚快照、签名 HAP 和日常启动入口保留。阶段资料移入 docs。未启动硬件实验。",
+      "updatedAt": "2026-11-24",
+      "evidence": [
+        {
+          "label": "清理记录与备份说明",
+          "path": "docs/daily-use-cleanup.md"
+        },
+        {
+          "label": "本地逐文件清理清单",
+          "path": ".local/evidence/2026-11-24/daily-use-cleanup-files.json"
+        }
+      ]
+    },
+    {
+      "id": "multi-touch",
+      "stage": "extended-features",
+      "parent": null,
+      "title": "实现多点触控",
+      "status": "todo",
+      "deps": [
+        "daily-close"
+      ],
+      "description": "在鸿蒙端跟踪多个触点并经现有 USB 会话回传，Windows 按帧注入原生触点。优先支持双指捏合缩放。",
+      "acceptance": "在支持触屏手势的 Windows 应用验证双指捏合缩放，复核单指兼容、两指先后抬起及断线取消。",
+      "updatedAt": "2026-11-24"
     }
   ],
   "history": [
@@ -344,7 +482,7 @@
         },
         {
           "label": "公开仓库准备独立核验要求",
-          "path": "REPO-PREP-VERIFY.md"
+          "path": "docs/repo-prep-verification.md"
         }
       ]
     },
@@ -367,9 +505,62 @@
       "detail": "根目录 Git 的 64 个候选路径与预检一致。交付物、原始归档、真机证据和回滚副本均在。用于构建验证的临时目录受忽略规则覆盖，按需清理即可。",
       "stage": "repo-prepare",
       "task": "repo-close"
+    },
+    {
+      "date": "2026-11-24",
+      "title": "修复 Windows 编码输出引用泄漏",
+      "detail": "用只采集和采集加编码两组本机测试定位编码输出。修复后的本机测试在预热后约 244 MiB，USB 短测时约 245 MiB，平板成功解码。",
+      "stage": "daily-use",
+      "task": "memory-stabilize",
+      "evidence": [
+        {
+          "label": "编码内存与 USB 回归记录",
+          "path": "docs/usb-verification.md"
+        }
+      ]
+    },
+    {
+      "date": "2026-11-24",
+      "title": "完成固定分辨率长测和日常入口复测",
+      "detail": "1920×1080 连续采样 30 分 27 秒，平均 25.00 fps，提交内存约 326–330 MiB。已确认拔插恢复、日常入口重复启动和正常退出。",
+      "stage": "daily-use",
+      "task": "one-click-start",
+      "evidence": [
+        {
+          "label": "USB 真机验证与日常入口记录",
+          "path": "docs/usb-verification.md"
+        }
+      ]
+    },
+    {
+      "date": "2026-11-24",
+      "title": "通过 Windows 原生单指触控真机复核",
+      "detail": "先验证只采集，再用鸿蒙 UITest 和用户手势分别确认 Windows 收到原生点按与拖动。测试结束后已恢复原显示布局并回收转发。",
+      "stage": "daily-use",
+      "task": "touch-input-implementation",
+      "evidence": [
+        {
+          "label": "手动触控手势日志",
+          "path": ".local/daily-tests/touch-probe/native-213715/gestures.log"
+        }
+      ]
     }
   ],
   "decisions": [
+    {
+      "date": "2026-11-24",
+      "title": "确认试用通过并开启扩展性功能阶段",
+      "detail": "用户确认日常使用试用通过，跳过经验整理，完成目录收尾后以实现多点触控作为下一阶段首项任务。刷新率研究暂缓。",
+      "stage": "daily-use",
+      "task": "daily-close"
+    },
+    {
+      "date": "2026-11-24",
+      "title": "以用户试用替代独立核验和用户审阅",
+      "detail": "按用户决定，稳定性与日常使用阶段进入用户试用。原核验清单保留作排查参考。",
+      "stage": "daily-use",
+      "task": "daily-trial"
+    },
     {
       "date": "2026-11-24",
       "title": "采用任务图看板",
@@ -393,6 +584,12 @@
       "title": "将项目基线存档到本地 Git",
       "detail": "用户确认将整理后的源码、构建说明、验证记录和任务看板纳入首次本地 Git 提交。",
       "stage": "repo-prepare"
+    },
+    {
+      "date": "2026-11-24",
+      "title": "登记两项后续研究",
+      "detail": "按用户要求，将刷新率调整与提升、平板触屏操作 Windows 扩展屏列为待办。",
+      "stage": "daily-use"
     }
   ]
 }
