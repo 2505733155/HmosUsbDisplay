@@ -1,0 +1,56 @@
+# Local workspace and downloaded installers
+/.local/
+/.subscreen-hvigor/
+/.subscreen-npm-cache/
+/HarmonyOS-Subscreen-*/
+/*.zip
+/deveco-install.config
+/vs-cache-cleanup.json
+/cleanup-deveco-partial.ps1
+/cleanup-vs-package-payloads.ps1
+
+# Windows build and test outputs
+*.exe
+*.obj
+*.map
+*.pdb
+*.ilk
+*.log
+/pc/subscreen_state.ini
+/pc/verify-local-*.txt
+/pc/tools/_*.txt
+/pc/tools/*_live*.log
+/subscreen-usb-proof-*.jpeg
+
+# HarmonyOS local settings, dependencies and build outputs
+/harmony/build-profile.json5
+/harmony/local.properties
+/harmony/.clangd
+/harmony/.clang-tidy
+.idea/
+.hvigor/
+.cxx/
+oh_modules/
+node_modules/
+build/
+*.hap
+*.hsp
+*.har
+*.app
+
+# Signing material
+*.p12
+*.p7b
+*.pfx
+*.cer
+*.jks
+*.keystore
+*.pem
+*.key
+
+# Python build tools
+__pycache__/
+*.pyc
+
+
+prompts
