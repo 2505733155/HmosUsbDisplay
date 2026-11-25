@@ -773,7 +773,7 @@
     "description": "将鸿蒙平板通过 USB 用作 Windows 扩展屏。日常使用阶段已收尾，下一阶段计划实现多点触控。",
     "projectRoot": "./",
     "storageKey": "hmos-usb-display",
-    "currentTaskId": "quiet-desktop-launch"
+    "currentTaskId": "restore-tablet-display-layout"
   },
   "statuses": {
     "skipped": {
@@ -1231,9 +1231,164 @@
           "path": ".local/daily-tests/desktop-unplug-230145/sender.log"
         }
       ]
+    },
+    {
+      "id": "restore-tablet-display-layout",
+      "stage": "extended-features",
+      "parent": "quiet-desktop-launch",
+      "title": "平板虚拟屏重连后恢复排列",
+      "status": "done",
+      "description": "Windows 发送端在移除虚拟屏之前保存实际坐标和其他活动屏幕的配置。重连时，若其他屏幕配置匹配且目标位置相邻、无重叠，则恢复位置。否则保留 Windows 给出的有效位置，必要时按默认方向靠边。分开判断是否需要修改分辨率和位置。",
+      "acceptance": "在同一组实体屏下，手动摆放平板虚拟屏后，拔插及退出重开均恢复上次位置。显示器配置变化时，新排列不造成重叠，也不意外移动实体屏。",
+      "verification": "发送端构建、布局回归测试和触控协议测试通过。新版已部署到日常入口，旧版已备份。关闭接收端及实际拔除再插回 USB 分别验证一次，断开时均保存平板坐标 (-2978, 2160)、回收虚拟屏及 USB 转发。重开后均核对三块屏幕坐标和模式与原布局一致，平板恢复到外接屏下方，1920×1080 推流约 25 fps。两次启动时 Windows 已给出原坐标，发送端保留该值。历史坐标优先和实体屏配置变化的回退由离线测试覆盖。",
+      "updatedAt": "2026-11-25",
+      "evidence": [
+        {
+          "label": "发送端的虚拟屏状态保存及应用逻辑",
+          "path": "pc/subscreen_sender.cpp"
+        },
+        {
+          "label": "布局恢复回归测试",
+          "path": "pc/tests/vdd_layout.cpp"
+        },
+        {
+          "label": "已部署的 Windows 发送端",
+          "path": ".local/layout-restore/subscreen_sender.exe"
+        },
+        {
+          "label": "旧版发送端回滚副本",
+          "path": ".local/layout-restore/subscreen_sender-before-layout.exe"
+        },
+        {
+          "label": "拔插后恢复布局与推流日志",
+          "path": "pc/sender.log"
+        },
+        {
+          "label": "Microsoft 单屏显示设置与 CDS_TEST 文档",
+          "path": "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-changedisplaysettingsexw"
+        }
+      ]
+    },
+    {
+      "id": "receiver-icon-selection",
+      "stage": "extended-features",
+      "parent": null,
+      "title": "更新鸿蒙接收端名称与图标",
+      "status": "done",
+      "description": "采用用户选定的 C 款图标。深蓝底上使用青色屏幕轮廓和白色 USB-C 插头，适配鸿蒙桌面分层图标与启动窗口。中文显示名为 USB 扩展屏，默认英文为 SubScreen。",
+      "acceptance": "桌面与启动窗口均引用 C 款图标资源，中英文名称进入签名 HAP，平板覆盖安装后能正常启动。",
+      "verification": "签名 HAP 构建通过，核对了三张打包图标、两种显示名和自动启动标识。待用户结束扩展屏会话后通过 HDC 覆盖安装并验证应用启动。平板包管理器登记了应用图标、标签和启动图标引用。未截取桌面或启动画面。",
+      "updatedAt": "2026-11-25",
+      "evidence": [
+        {
+          "label": "C 款启动图标",
+          "path": "harmony/entry/src/main/resources/base/media/startIcon.png"
+        },
+        {
+          "label": "已安装的签名 HAP",
+          "path": ".local/receiver-icon-c/entry-default-signed.hap"
+        }
+      ]
     }
   ],
   "history": [
+    {
+      "date": "2026-11-25",
+      "title": "核对布局恢复与接收端外观的提交范围",
+      "detail": "按用户要求将 Windows 虚拟屏布局恢复、鸿蒙接收端中英文名称与 C 款图标、布局回归测试和看板记录纳入同一次提交。提交前重新构建 Windows 发送端并运行布局和触控协议测试，核对鸿蒙签名包所用资源与提交版本一致。"
+    },
+    {
+      "date": "2026-11-25",
+      "title": "实际拔插后恢复平板排列",
+      "detail": "用户物理拔线并重新插回。拔线后旧会话退出，虚拟显示器与 USB 转发已回收，坐标已保存。通过原桌面入口重启后，平板回到外接屏下方的 (-2978, 2160)，两块实体屏的坐标、分辨率和刷新率不变，平板推流恢复至 1920×1080 约 25 fps。",
+      "stage": "extended-features",
+      "task": "restore-tablet-display-layout"
+    },
+    {
+      "date": "2026-11-25",
+      "title": "部署新版并验证退出重开后恢复平板位置",
+      "detail": "旧会话退出后将已构建的发送端替换到日常入口。关闭接收端后确认新版保存了在外接屏下方的坐标，回收虚拟屏及 USB 转发。重开时三个屏幕的坐标和模式一致，1080p 推流恢复到约 25 fps。物理拔插待用户配合。",
+      "stage": "extended-features",
+      "task": "restore-tablet-display-layout"
+    },
+    {
+      "date": "2026-11-25",
+      "title": "实现虚拟屏位置保存和恢复",
+      "detail": "Windows 发送端保留旧分辨率状态文件的兼容性，在同一文件存储坐标与布局匹配信息。测试覆盖恢复外接屏下方的位置、配置变化后保留有效位置、拒绝重叠或悬空坐标，以及按实际模式尺寸摆位。构建和现有触控协议测试通过。待正在使用的 USB 会话结束后替换运行版本并完成真机验证。",
+      "stage": "extended-features",
+      "task": "restore-tablet-display-layout"
+    },
+    {
+      "date": "2026-11-25",
+      "title": "完成虚拟屏布局恢复的可行性评估",
+      "detail": "Windows 在当前布局下已登记平板虚拟屏的位置。单纯取消默认摆位有机会让 Windows 沿用该记录，但尚未验证虚拟屏重建后的自动恢复。建议在发送端补上坐标保存和有条件的恢复。实际三屏配置的测试请求通过两种 Windows API 验证；探针未应用任何配置。",
+      "stage": "extended-features",
+      "task": "restore-tablet-display-layout"
+    },
+    {
+      "date": "2026-11-25",
+      "title": "定位平板虚拟屏重连后排列变化",
+      "detail": "用户报告拔线重连后虚拟屏相对位置变化。发送端按会话创建和移除 Parsec 虚拟显示器，状态文件只保存分辨率和刷新率。重连读到已保存的显示模式后，即使当前分辨率相同，也会尝试写入按现有屏幕边缘计算的默认坐标。现有运行日志记录同名 DISPLAY32 在不同会话被设为不同坐标。本次核对源码和既有日志，未修改发送端或进行新的拔插实验。",
+      "stage": "extended-features",
+      "evidence": [
+        {
+          "label": "Windows 发送端虚拟屏重建与摆位逻辑",
+          "path": "pc/subscreen_sender.cpp"
+        },
+        {
+          "label": "既有 USB 拔插与虚拟屏重建记录",
+          "path": "docs/usb-verification.md"
+        }
+      ]
+    },
+    {
+      "date": "2026-11-25",
+      "title": "安装采用 C 款图标的鸿蒙接收端",
+      "detail": "用户选择由深蓝底、青色屏幕和白色 USB-C 插头组成的 C 款。已更新应用级和入口分层图标，以及启动图标。签名构建成功。用户结束原 USB 扩展屏会话后，覆盖安装成功，使用原包名和 EntryAbility 启动成功。",
+      "stage": "extended-features",
+      "task": "receiver-icon-selection"
+    },
+    {
+      "date": "2026-11-25",
+      "title": "统一接收端显示名并提供图标预览",
+      "detail": "用户确认中文显示名为 USB 扩展屏，默认英文名沿用 SubScreen。已更新应用级和桌面入口的名称资源。迁移检查发现四个依赖目录链接仍指向 D:/Desktop/HmosUsbDisplay。使用新位置的依赖文件和现有工具缓存，在干净目录完成未签名 HAP 构建，并从包内确认中英文名称和自动启动标识。尚未安装到平板。图标预览提供 A 有线连接、B 平板副屏、C USB-C 接口和 D 桌面延伸四种方向，待用户选择后更新。",
+      "stage": "extended-features",
+      "task": "receiver-icon-selection",
+      "evidence": [
+        {
+          "label": "应用级简体中文显示名",
+          "path": "harmony/AppScope/resources/zh_CN/element/string.json"
+        },
+        {
+          "label": "桌面入口简体中文显示名",
+          "path": "harmony/entry/src/main/resources/zh_CN/element/string.json"
+        },
+        {
+          "label": "桌面入口英文显示名",
+          "path": "harmony/entry/src/main/resources/base/element/string.json"
+        }
+      ]
+    },
+    {
+      "date": "2026-11-25",
+      "title": "核对鸿蒙接收端名称与图标",
+      "detail": "应用级名称为 SubScreen，桌面入口标签仍是占位文字 label。应用与入口使用同一套蓝底四格图形，启动窗口也使用四格图标。建议把应用与桌面入口的中文显示名统一为 USB 扩展屏，英文沿用 SubScreen，并以显示器和平板相连的图形更新桌面和启动图标。Windows 发送端自动启动依赖 com.example.subscreen 和 EntryAbility，调整显示名称与图标时应保留这两个标识。本次仅核对源码和图像资源，未修改接收端或在平板上验证。",
+      "stage": "extended-features",
+      "evidence": [
+        {
+          "label": "应用级名称和图标配置",
+          "path": "harmony/AppScope/app.json5"
+        },
+        {
+          "label": "桌面入口与启动窗口配置",
+          "path": "harmony/entry/src/main/module.json5"
+        },
+        {
+          "label": "桌面入口文字资源",
+          "path": "harmony/entry/src/main/resources/base/element/string.json"
+        }
+      ]
+    },
     {
       "date": "2026-11-24",
       "title": "清理双指触控与静默启动的构建产物",

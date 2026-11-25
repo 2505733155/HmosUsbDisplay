@@ -112,12 +112,14 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 // Parsec VDD core API (内核 IddCx 虚拟显示驱动的用户态控制接口, 自带 setupapi/cfgmgr32 链接指令)
 #include "third_party/parsec-vdd.h"
+#include "vdd_layout.h"
 #include "touch_input.h"
 
 #pragma comment(lib, "ole32.lib")
@@ -3036,45 +3038,131 @@ struct VddOptions
     bool fixedMode = false;    // true: 强制设为 w×h@hz; false: 沿用上次用的/Windows 记住的分辨率
     bool saveState = true;     // 移除显示器时是否把真实分辨率记进 ini(诊断模式要关掉, 免得污染)
     std::string side = "left"; // 摆位方向: left / right
+    bool forceSide = false;    // 显式传入 --side 时使用指定一侧
 };
 
-// 上次实际使用的虚拟显示器分辨率(记在 exe 同目录的 ini 里)。
-// 目的: 你在 Windows 显示设置里调好一次, 之后每次插入都复现这个值, 不会被默认值覆盖。
-static std::string VddStatePath()
+struct VddSavedState
 {
-    char exe[MAX_PATH]{};
-    GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    std::string dir = exe;
-    size_t p = dir.find_last_of("\\/");
-    if (p != std::string::npos) {
+    int w = 0, h = 0, hz = 0;
+    std::optional<VddSavedPosition> placement;
+};
+
+static std::wstring VddStatePath()
+{
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir = exe;
+    size_t p = dir.find_last_of(L"\\/");
+    if (p != std::wstring::npos) {
         dir = dir.substr(0, p);
     }
-    return dir + "\\subscreen_state.ini";
+    return dir + L"\\subscreen_state.ini";
 }
 
-static bool VddStateLoad(int *w, int *h, int *hz)
+static VddSavedState VddStateLoad()
 {
-    std::ifstream f(VddStatePath());
-    if (!f) {
-        return false;
-    }
+    std::ifstream f(VddStatePath().c_str());
+    VddSavedState state;
+    std::optional<POINTL> position;
+    std::string layoutKey;
     std::string line;
     while (std::getline(f, line)) {
         if (line.rfind("vdd=", 0) == 0) {
-            return ParseSizeSpec(line.substr(4), w, h, hz) && *w >= 320 && *h >= 240;
+            int w = 0, h = 0, hz = 0;
+            if (ParseSizeSpec(line.substr(4), &w, &h, &hz) && w >= 320 && h >= 240) {
+                state.w = w;
+                state.h = h;
+                state.hz = hz;
+            }
+        } else if (line.rfind("position=", 0) == 0) {
+            std::istringstream xy(line.substr(9));
+            POINTL point{};
+            char comma = 0;
+            if (xy >> point.x >> comma >> point.y && comma == ',' && (xy >> std::ws).eof()) {
+                position = point;
+            }
+        } else if (line.rfind("layout=", 0) == 0) {
+            layoutKey = line.substr(7);
         }
     }
-    return false;
+    if (position && !layoutKey.empty()) {
+        state.placement = VddSavedPosition{*position, std::move(layoutKey)};
+    }
+    return state;
 }
 
-static void VddStateSave(int w, int h, int hz)
+static void VddStateSave(const DEVMODEW &mode, const std::optional<VddSavedPosition> &placement)
 {
-    std::ofstream f(VddStatePath(), std::ios::trunc);
-    if (!f) {
-        return;
+    const auto path = VddStatePath();
+    const auto temp = path + L"." + std::to_wstring(GetCurrentProcessId()) + L".tmp";
+    std::ofstream f(temp.c_str(), std::ios::trunc);
+    f << "# SubScreenPC: saved virtual display mode and desktop position\n";
+    f << "vdd=" << mode.dmPelsWidth << "x" << mode.dmPelsHeight << "@"
+      << (mode.dmDisplayFrequency ? mode.dmDisplayFrequency : 60) << "\n";
+    if (placement) {
+        f << "position=" << placement->position.x << "," << placement->position.y << "\n";
+        f << "layout=" << placement->key << "\n";
     }
-    f << "# SubScreenPC 状态: 虚拟显示器上次实际使用的分辨率\n";
-    f << "vdd=" << w << "x" << h << "@" << hz << "\n";
+    f.close();
+    if (!f || !MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temp.c_str());
+        Log("[警告] 无法保存虚拟显示器的分辨率与位置");
+    }
+}
+
+static RECT VddModeBounds(const DEVMODEW &mode)
+{
+    const auto &p = mode.dmPosition;
+    return RECT{p.x, p.y, p.x + static_cast<LONG>(mode.dmPelsWidth), p.y + static_cast<LONG>(mode.dmPelsHeight)};
+}
+
+static VddDesktopLayout VddReadDesktopLayout(const std::wstring &tabletName, const DEVMODEW &tabletMode)
+{
+    VddDesktopLayout layout;
+    layout.tablet = VddModeBounds(tabletMode);
+    const auto names = CcdActiveDisplayNames();
+    std::vector<std::wstring> keys;
+    bool identified = true;
+    for (const auto &output : EnumOutputs()) {
+        if (output.deviceName == tabletName) {
+            continue;
+        }
+        DEVMODEW mode{};
+        mode.dmSize = sizeof(mode);
+        if (!EnumDisplaySettingsExW(output.deviceName.c_str(), ENUM_CURRENT_SETTINGS, &mode, 0) ||
+            !(mode.dmFields & DM_POSITION) || !mode.dmPelsWidth || !mode.dmPelsHeight) {
+            layout.others.push_back(output.desc.DesktopCoordinates);
+            identified = false;
+            continue;
+        }
+        const RECT bounds = VddModeBounds(mode);
+        layout.others.push_back(bounds);
+        const size_t before = keys.size();
+        for (const auto &[device, id] : names) {
+            const auto path = id.substr(0, id.find(L'|'));
+            if (device == output.deviceName && !path.empty()) {
+                keys.push_back(path + L"|" + std::to_wstring(bounds.left) + L"," + std::to_wstring(bounds.top) +
+                               L"," + std::to_wstring(bounds.right) + L"," + std::to_wstring(bounds.bottom) +
+                               L"," + std::to_wstring(mode.dmDisplayOrientation));
+            }
+        }
+        identified = identified && keys.size() > before;
+    }
+    if (identified && !keys.empty()) {
+        std::sort(keys.begin(), keys.end());
+        std::wstring signature;
+        for (const auto &key : keys) {
+            signature += std::to_wstring(key.size()) + L":" + key;
+        }
+        const int count = WideCharToMultiByte(CP_UTF8, 0, signature.data(), (int)signature.size(), nullptr, 0,
+                                              nullptr, nullptr);
+        if (count > 0) {
+            layout.key.resize(count);
+            WideCharToMultiByte(CP_UTF8, 0, signature.data(), (int)signature.size(), layout.key.data(), count,
+                                nullptr, nullptr);
+        }
+    }
+    return layout;
 }
 
 // ================== CCD(显示配置) 拓扑激活: 解决"虚拟屏到达但不激活" ==================
@@ -3683,7 +3771,7 @@ public:
         }
         Log("虚拟显示器已就位: %ls (DXGI #%d)", devName.c_str(), newIndex);
 
-        // 按需设分辨率/摆位(默认不改分辨率, 只在重叠时摆到一侧)
+        // 分别恢复上次实际使用的模式和桌面位置。
         ApplyDisplay(devName, opt);
         std::this_thread::sleep_for(std::chrono::milliseconds(700));
 
@@ -3722,15 +3810,24 @@ public:
                 ping_.join();
             }
         }
-        // 移除之前把"真实生效的分辨率"记下来 —— 包括用户在 Windows 显示设置里手动改过的值。
-        // 下次插入就复现它, 既尊重用户的选择, 也避免我们每次都用默认值覆盖。
+        // 读取仍在桌面上的虚拟屏，包括用户在 Windows 显示设置中调整过的模式和位置。
         if (added_ && opt_.saveState && !devName_.empty()) {
             DEVMODEW cur{};
             cur.dmSize = sizeof(DEVMODEW);
             if (EnumDisplaySettingsExW(devName_.c_str(), ENUM_CURRENT_SETTINGS, &cur, 0) &&
                 cur.dmPelsWidth > 0 && cur.dmPelsHeight > 0) {
-                VddStateSave((int)cur.dmPelsWidth, (int)cur.dmPelsHeight,
-                             (int)(cur.dmDisplayFrequency ? cur.dmDisplayFrequency : 60));
+                std::optional<VddSavedPosition> placement;
+                if (cur.dmFields & DM_POSITION) {
+                    auto layout = VddReadDesktopLayout(devName_, cur);
+                    if (!layout.key.empty() && VddPositionFits(cur.dmPosition, (LONG)cur.dmPelsWidth,
+                                                               (LONG)cur.dmPelsHeight, layout.others)) {
+                        placement = VddSavedPosition{cur.dmPosition, std::move(layout.key)};
+                    }
+                }
+                if (!placement) {
+                    placement = VddStateLoad().placement;
+                }
+                VddStateSave(cur, placement);
             }
         }
         if (added_ && vdd_ != INVALID_HANDLE_VALUE) {
@@ -3777,8 +3874,8 @@ private:
     //   * 分辨率: 默认**不动**。优先复现"上次实际用过的"值(记在 subscreen_state.ini,
     //     由 Cleanup 在移除显示器前抓取真实值写入), 所以你在 Windows 显示设置里调的
     //     任何值都会被沿用, 不会被我们覆盖回默认值。仅 --vdd-fixed 才强制覆盖。
-    //   * 摆位: 只在它与已有屏幕**重叠**时才移到 --side 指定的一侧; 用户手动拖开之后
-    //     不会被我们拽回来。
+    //   * 摆位: 优先恢复同一桌面配置中的有效历史位置，其次沿用 Windows 位置。
+    //     两者都不可用时才默认靠边，显式传入 --side 则使用指定一侧。
     //
     // 选模式的回退策略: 先精确匹配; 匹配不到则退到"长宽比最接近"的模式, 再在同比例
     // 候选里取面积最接近的 —— 竖屏目标不会被退成 16:9 横向而被拉扁。
@@ -3800,14 +3897,14 @@ private:
         int wantW = opt.w, wantH = opt.h, wantHz = opt.hz;
         bool applySize = false;
         bool fromState = false;
+        const auto saved = VddStateLoad();
         if (opt.fixedMode) {
             applySize = true;
         } else {
-            int sw = 0, sh = 0, shz = 0;
-            if (VddStateLoad(&sw, &sh, &shz)) {
-                wantW = sw;
-                wantH = sh;
-                wantHz = shz;
+            if (saved.w && saved.h) {
+                wantW = saved.w;
+                wantH = saved.h;
+                wantHz = saved.hz;
                 applySize = true;
                 fromState = true;
                 Log("沿用上次使用过的虚拟显示器分辨率 %d×%d@%d", wantW, wantH, wantHz);
@@ -3858,85 +3955,11 @@ private:
             }
         }
 
-        // ---- 2) 计算摆位 ----
-        RECT self{};
-        bool haveSelf = false;
-        std::vector<RECT> others;
-        bool haveEdge = false, havePrimary = false, haveAny = false;
-        LONG minLeft = 0, maxRight = 0, primaryTop = 0, firstTop = 0;
-        for (auto &e : EnumOutputs()) {
-            const RECT &r = e.desc.DesktopCoordinates;
-            if (e.deviceName == devName) {
-                self = r;
-                haveSelf = true;
-                continue;
-            }
-            others.push_back(r);
-            if (!haveAny) {
-                firstTop = r.top;
-                haveAny = true;
-            }
-            if (!haveEdge || r.left < minLeft) {
-                minLeft = r.left;
-            }
-            if (!haveEdge || r.right > maxRight) {
-                maxRight = r.right;
-            }
-            haveEdge = true;
-            if (r.left == 0 && r.top == 0) {
-                primaryTop = r.top;
-                havePrimary = true;
-            }
-        }
-        bool overlaps = false;
-        if (haveSelf) {
-            for (auto &r : others) {
-                if (self.left < r.right && self.right > r.left && self.top < r.bottom && self.bottom > r.top) {
-                    overlaps = true;
-                    break;
-                }
-            }
-        }
-        LONG top = havePrimary ? primaryTop : (haveAny ? firstTop : 0);
-
-        // 左侧定位时用"本次生效的宽度"算 x, 否则会算错
-        int effW = applySize ? wantW : (haveSelf ? (int)(self.right - self.left) : opt.w);
-        LONG x = 0;
-        if (opt.side == "right") {
-            x = haveEdge ? maxRight : 0;
-        } else {
-            x = haveEdge ? (minLeft - (LONG)effW) : 0;
-        }
-
-        // ---- 3) 决定要动哪些字段 ----
-        DWORD fields = 0;
-        bool movePos = overlaps || opt.fixedMode || !haveSelf;
-        if (applySize) {
-            movePos = true; // 改分辨率时一并给位置, 否则系统可能把新尺寸摆到重叠处
-        }
-        if (!applySize && !movePos) {
-            if (haveSelf) {
-                Log("虚拟显示器: 沿用 Windows 记住的设置 %d×%d @(%ld,%ld), 未改动",
-                    (int)(self.right - self.left), (int)(self.bottom - self.top), self.left, self.top);
-            }
-            return;
-        }
-        if (applySize) {
-            fields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-        }
-        if (movePos) {
-            fields |= DM_POSITION;
-        }
-
-        // ---- 4) 需要改分辨率时先挑模式 ----
+        // ---- 2) 需要改分辨率时先挑模式 ----
         int pickW = 0, pickH = 0, pickHz = 0;
         if (applySize) {
             if (modes.empty()) {
                 Log("[警告] 未枚举到虚拟显示器可用模式, 沿用系统默认分辨率");
-                fields &= ~(DWORD)(DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY);
-                if (!fields) {
-                    return;
-                }
             } else {
                 int pick = -1;
                 for (size_t i = 0; i < modes.size(); i++) {
@@ -4023,37 +4046,57 @@ private:
             }
         }
 
-        // ---- 5) 应用 ----
+        // ---- 3) 位置与模式分别判断，避免恢复同一分辨率时覆盖 Windows 的位置 ----
         DEVMODEW out{};
         out.dmSize = sizeof(DEVMODEW);
-        if (!EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &out, 0)) {
-            out.dmSize = sizeof(DEVMODEW);
+        if (!EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &out, 0) ||
+            !out.dmPelsWidth || !out.dmPelsHeight) {
+            Log("[警告] 无法读取虚拟显示器当前模式，保留 Windows 设置");
+            return;
         }
-        if (applySize && pickW > 0) {
+        const auto layout = VddReadDesktopLayout(devName, out);
+        const POINTL current = out.dmPosition;
+        const LONG width = pickW > 0 ? (LONG)pickW : (LONG)out.dmPelsWidth;
+        const LONG height = pickH > 0 ? (LONG)pickH : (LONG)out.dmPelsHeight;
+        const POINTL position = VddChoosePosition(layout, width, height, saved.placement,
+                                                 opt.side == "right", opt.forceSide);
+        DWORD fields = 0;
+        const bool changeMode = pickW > 0 && ((DWORD)pickW != out.dmPelsWidth || (DWORD)pickH != out.dmPelsHeight ||
+                                             (DWORD)pickHz != out.dmDisplayFrequency);
+        if (changeMode) {
             out.dmPelsWidth = (DWORD)pickW;
             out.dmPelsHeight = (DWORD)pickH;
             out.dmDisplayFrequency = (DWORD)pickHz;
+            fields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
         }
-        if (movePos) {
-            out.dmPosition.x = x;
-            out.dmPosition.y = top;
+        if (position.x != current.x || position.y != current.y || !(out.dmFields & DM_POSITION)) {
+            out.dmPosition = position;
+            fields |= DM_POSITION;
+        }
+        if (!fields) {
+            Log("虚拟显示器: 沿用 Windows 当前设置 %lu×%lu@%luHz @(%ld,%ld)", out.dmPelsWidth,
+                out.dmPelsHeight, out.dmDisplayFrequency, current.x, current.y);
+            return;
         }
         out.dmFields = fields | DM_BITSPERPEL;
-
         LONG r = ChangeDisplaySettingsExW(devName.c_str(), &out, nullptr, CDS_UPDATEREGISTRY, nullptr);
-        if (r != DISP_CHANGE_SUCCESSFUL) {
-            // 位置常是失败原因(例如与已有屏幕重叠), 退一步: 只改分辨率、不动位置
-            out.dmFields = (fields & ~(DWORD)DM_POSITION) | DM_BITSPERPEL;
-            LONG r2 = ChangeDisplaySettingsExW(devName.c_str(), &out, nullptr, CDS_UPDATEREGISTRY, nullptr);
-            Log("[警告] 设置虚拟显示器失败(code=%ld), 改为只设分辨率重试: %ld", r, r2);
-            if (r2 != DISP_CHANGE_SUCCESSFUL) {
-                Log("       保持当前设置不变");
-                return;
-            }
+        if (r != DISP_CHANGE_SUCCESSFUL && (fields & DM_POSITION) && changeMode &&
+            VddPositionFits(current, width, height, layout.others)) {
+            out.dmPosition = current;
+            out.dmFields &= ~(DWORD)DM_POSITION;
+            Log("[警告] 无法同时设置模式和位置 (code=%ld)，仅重试显示模式", r);
+            r = ChangeDisplaySettingsExW(devName.c_str(), &out, nullptr, CDS_UPDATEREGISTRY, nullptr);
         }
-        Log("虚拟显示器已设置: %d×%d@%dHz @(%ld,%ld) [%s]", applySize ? pickW : (int)out.dmPelsWidth,
-            applySize ? pickH : (int)out.dmPelsHeight, (int)out.dmDisplayFrequency, out.dmPosition.x,
-            out.dmPosition.y, opt.side == "right" ? "右侧" : "左侧");
+        if (r != DISP_CHANGE_SUCCESSFUL) {
+            Log("[警告] 设置虚拟显示器失败 (code=%ld)", r);
+            return;
+        }
+        DEVMODEW effective{};
+        effective.dmSize = sizeof(effective);
+        if (EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &effective, 0)) {
+            Log("虚拟显示器已设置: %lu×%lu@%luHz @(%ld,%ld)", effective.dmPelsWidth, effective.dmPelsHeight,
+                effective.dmDisplayFrequency, effective.dmPosition.x, effective.dmPosition.y);
+        }
     }
 
     HANDLE vdd_ = INVALID_HANDLE_VALUE;
@@ -4077,6 +4120,7 @@ static int VddProbe(bool keepAlive = true)
     opt.hz = 60;
     opt.fixedMode = true; // 诊断时强制一个已知模式, 便于对比
     opt.side = "right";
+    opt.forceSide = true;
     opt.saveState = false; // 别把诊断用的分辨率写进状态文件
     int idx = -1;
     if (!vdd.Create(opt, &idx, keepAlive)) {
@@ -4162,6 +4206,7 @@ struct Args
     int vddH = 1440;
     int vddHz = 60;
     std::string side = "left"; // 虚拟显示器摆在外接屏的哪一侧
+    bool forceSide = false;
     bool watch = false;        // 插拔守护模式
     bool touch = false;        // --touch: native input in USB watch mode
     bool once = false;         // --once: exit after the USB session ends
@@ -4273,6 +4318,7 @@ static Args ParseArgs(int argc, char **argv)
         } else if (s == "--side") {
             std::string v = next();
             a.side = (v == "right" || v == "r") ? "right" : "left";
+            a.forceSide = true;
         } else if (s == "--vdd-fixed") {
             a.vdd = true;
             a.vddFixed = true;
@@ -4881,6 +4927,7 @@ static int WatchSession(const Args &args, const std::string &hdc)
     opt.hz = args.vddHz;
     opt.fixedMode = args.vddFixed;
     opt.side = args.side;
+    opt.forceSide = args.forceSide;
 
     int outIndex = -1;
     if (!vdd.Create(opt, &outIndex)) {
@@ -5844,6 +5891,7 @@ int main(int argc, char **argv)
         opt.hz = args.vddHz;
         opt.fixedMode = args.vddFixed;
         opt.side = args.side;
+        opt.forceSide = args.forceSide;
         if (!vdd.Create(opt, &outIndex)) {
             return 3;
         }
